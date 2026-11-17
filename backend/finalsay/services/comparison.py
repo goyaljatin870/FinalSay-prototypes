@@ -161,6 +161,47 @@ def _schedule_date_conflicts(
     }
 
 
+_OFFICIAL_REVISION_RE = re.compile(
+    r"\b(?:postpon(?:ed|ement)?|reschedul(?:ed|ing)?|revised|revision|"
+    r"new\s+date|instead\s+of|previously\s+scheduled|earlier\s+date|"
+    r"supersed(?:e|es|ed|ing)|replac(?:e|es|ed|ing)\s+by|amend(?:ed|ment))\b",
+    re.IGNORECASE,
+)
+
+
+def _official_revision_explains_conflict(
+    official: Notice,
+    submission: Notice,
+    conflicts: dict[str, tuple[set[tuple[int, int, int | None]], set[tuple[int, int, int | None]]]],
+) -> bool:
+    """Check whether a readable current source explicitly revises submitted facts.
+
+    A notice can mention the old and new schedule in separate sentences. NLI
+    may select the shared old-date sentence and call the documents consistent;
+    this guard uses the whole official body but only converts to superseded
+    when there is both explicit revision language and conflicting schedule
+    facts. A revision-style title alone is not sufficient evidence.
+    """
+    official_text = "\n".join(
+        part for part in (
+            official.action,
+            official.redacted_text,
+            getattr(official, "supplemental_extracted_text", ""),
+        ) if part
+    )
+    official_body = "\n".join(
+        line for line in official_text.splitlines()
+        if not re.match(r"^\s*(?:subject|title)\s*:", line, re.IGNORECASE)
+    )
+    if not _OFFICIAL_REVISION_RE.search(official_body):
+        return False
+
+    for official_dates, submitted_dates in conflicts.values():
+        if submitted_dates and official_dates - submitted_dates:
+            return True
+    return False
+
+
 def _explicit_revision_title_match(submission: Notice, official: Notice) -> bool:
     """Prefer a portal's clearly marked revision over its original same-topic notice."""
     submission_title = submission.title or ""
@@ -206,8 +247,15 @@ def _revision_first(submission: Notice, candidates: list[Candidate]) -> list[Can
         key=lambda item: (
             _explicit_revision_title_match(submission, item.notice),
             update_match(item),
-            publication_order(item),
+            # A later publication date is meaningful only after topic relevance
+            # and retrieval score. Previously it sorted every candidate by date
+            # before score, so a recent unrelated exam notice could beat an old
+            # exact-title match by months.
+            item.title_similarity or _title_topic_similarity(
+                submission.title, item.notice.title
+            ),
             item.score,
+            publication_order(item),
         ),
         reverse=True,
     )
@@ -236,6 +284,8 @@ def retrieve_candidates(
     query = select(Notice).where(
         Notice.kind == "official",
         Notice.is_current.is_(True),
+        Notice.admin_status == "active",
+        Notice.source_state == "active",
         Notice.id != submission.id,
     )
     if submission.institution_id is not None:
@@ -250,7 +300,12 @@ def retrieve_candidates(
                 NoticeDocumentExtraction.extracted_text,
             )
             .join(Notice, Notice.id == NoticeDocumentExtraction.notice_id)
-            .where(Notice.kind == "official", Notice.is_current.is_(True))
+            .where(
+                Notice.kind == "official",
+                Notice.is_current.is_(True),
+                Notice.admin_status == "active",
+                Notice.source_state == "active",
+            )
         )
         if submission.institution_id is not None:
             supplement_query = supplement_query.where(
@@ -426,19 +481,26 @@ def classify_submission(
 
         schedule_conflicts = _schedule_date_conflicts(best, submission)
         if label == "consistent" and schedule_conflicts:
-            rationale = (
-                "The model found the notices semantically similar, but their "
-                "schedule or deadline dates conflict. Routed to reviewer instead "
-                "of asserting that both notices are consistent."
-            )
             for category, (official_dates, submitted_dates) in sorted(schedule_conflicts.items()):
                 evidence.append(
                     f"Date safety check ({category}): official notice contains "
                     f"{sorted(official_dates)}; submitted notice contains "
                     f"{sorted(submitted_dates)}."
                 )
-            label = "unresolved"
-            gated = True
+            if _official_revision_explains_conflict(best, submission, schedule_conflicts):
+                label = "superseded"
+                rationale = (
+                    "The current official notice explicitly revises a schedule "
+                    "date in the submitted copy. The submitted notice is superseded."
+                )
+            else:
+                rationale = (
+                    "The model found the notices semantically similar, but their "
+                    "schedule or deadline dates conflict. Routed to reviewer instead "
+                    "of asserting that both notices are consistent."
+                )
+                label = "unresolved"
+                gated = True
 
         if _has_listing_only_evidence(best):
             evidence.append(

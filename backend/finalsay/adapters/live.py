@@ -28,6 +28,8 @@ MAX_HTML_BYTES = 20_000_000
 MAX_JSON_BYTES = 3_000_000
 MAX_PDF_BYTES = 20_000_000
 MAX_NOTICES_PER_SOURCE = 250
+MAX_CATALOG_SNAPSHOT_PAGES = 500
+CATALOG_SNAPSHOT_PAGES_PER_POLL = 5
 MAX_REQUEST_ATTEMPTS = 3
 MIN_REQUEST_INTERVAL = 0.5
 MAX_RESPONSE_SECONDS = 45
@@ -62,6 +64,10 @@ class SourceFetchError(RuntimeError):
     """A configured source could not be fetched safely or reliably."""
 
 
+class SourceNotModified(RuntimeError):
+    """The source confirmed that a previously fetched document is unchanged."""
+
+
 def _read_bounded_response(response, max_bytes: int, *, clock=time.monotonic) -> bytes:
     """Read a response with both a byte cap and an overall wall-clock bound."""
     content_length = response.headers.get("Content-Length")
@@ -84,7 +90,17 @@ def _read_bounded_response(response, max_bytes: int, *, clock=time.monotonic) ->
                 f"response exceeded {MAX_RESPONSE_SECONDS}-second time limit"
             )
         if raw_socket is not None:
-            raw_socket.settimeout(min(18.0, remaining))
+            # urllib can leave a closed socket object attached to a response
+            # whose body is already buffered (for example after a server
+            # sends ``Connection: close``).  Calling settimeout() on that
+            # object raises EBADF before we can consume the buffered body.
+            # Keep the socket timeout for live connections, but treat a
+            # closed/invalid socket as already detached from network I/O.
+            try:
+                if raw_socket.fileno() >= 0:
+                    raw_socket.settimeout(min(18.0, remaining))
+            except (OSError, ValueError):
+                pass
         chunk = response.read(min(RESPONSE_CHUNK_BYTES, max_bytes + 1 - total))
         if not chunk:
             break
@@ -180,10 +196,15 @@ class PublicSiteClient:
             time.sleep(MIN_REQUEST_INTERVAL - (now - previous))
         self._last_request[host] = time.monotonic()
 
-    def _single_get(self, url: str, max_bytes: int):
+    def _single_get(self, url: str, max_bytes: int, request_headers: dict[str, str] | None = None):
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/json,application/pdf,*/*;q=0.5",
+        }
+        headers.update(request_headers or {})
         request = Request(
             url,
-            headers={"User-Agent": self.user_agent, "Accept": "text/html,application/json,application/pdf,*/*;q=0.5"},
+            headers=headers,
             method="GET",
         )
         try:
@@ -209,13 +230,24 @@ class PublicSiteClient:
                 ) from exc
             return response.status, response.headers, body
 
-    def _get_with_retries(self, url: str, max_bytes: int, host: str):
+    def _get_with_retries(
+        self,
+        url: str,
+        max_bytes: int,
+        host: str,
+        request_headers: dict[str, str] | None = None,
+    ):
         """Retry transient transport failures and rate/server errors twice."""
         transient_statuses = {429, 500, 502, 503, 504}
         for attempt in range(MAX_REQUEST_ATTEMPTS):
             self._wait_for_host(host)
             try:
-                status, headers, body = self._single_get(url, max_bytes)
+                if request_headers is None:
+                    status, headers, body = self._single_get(url, max_bytes)
+                else:
+                    status, headers, body = self._single_get(
+                        url, max_bytes, request_headers
+                    )
             except SourceFetchError as exc:
                 # Size-limit and validation errors are deterministic and must
                 # not trigger another download.
@@ -300,7 +332,15 @@ class PublicSiteClient:
             return True
         return bool(parser.can_fetch(self.user_agent.split("/", 1)[0], url))
 
-    def get(self, url: str, max_bytes: int, *, check_robots: bool = True):
+    def get(
+        self,
+        url: str,
+        max_bytes: int,
+        *,
+        check_robots: bool = True,
+        request_headers: dict[str, str] | None = None,
+        allow_not_modified: bool = False,
+    ):
         current = url
         original_host = validate_source_url(current, self.allowed_hosts)
         if check_robots and not self._robots_allows(current, original_host):
@@ -309,13 +349,17 @@ class PublicSiteClient:
             host = validate_source_url(current, self.allowed_hosts)
             if host != original_host and _site_domain(host) != _site_domain(original_host):
                 raise SourceFetchError("cross-host redirects are not permitted")
-            status, headers, body = self._get_with_retries(current, max_bytes, host)
+            status, headers, body = self._get_with_retries(
+                current, max_bytes, host, request_headers
+            )
             if status in (301, 302, 303, 307, 308):
                 location = headers.get("Location")
                 if not location:
                     raise SourceFetchError(f"HTTP {status} redirect did not include a destination")
                 current = urljoin(current, location)
                 continue
+            if status == 304 and allow_not_modified:
+                raise SourceNotModified(current)
             if status < 200 or status >= 300:
                 raise SourceFetchError(f"source returned HTTP {status}")
             return current, headers, body
@@ -323,7 +367,13 @@ class PublicSiteClient:
 
 
 class _ThaparNoticeLinks(HTMLParser):
-    """Read the public DoAA page's NOTICE ordered-list links only."""
+    """Read links from the NOTICE section on Thapar's public notice pages.
+
+    Thapar uses both heading-based ordered lists (the Dean of Academic Affairs
+    page) and a plain NOTICE label followed by an unordered list (Student
+    Notices). Keep the capture limited to that section so footer/navigation
+    links are not treated as notices.
+    """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -332,6 +382,7 @@ class _ThaparNoticeLinks(HTMLParser):
         self._heading_text: list[str] = []
         self._pending_notice_list = False
         self._list_depth = 0
+        self._list_tag: str | None = None
         self._anchor: tuple[str, list[str]] | None = None
 
     def handle_starttag(self, tag: str, attrs):  # noqa: ANN001
@@ -339,10 +390,11 @@ class _ThaparNoticeLinks(HTMLParser):
         if tag.lower() in {"h2", "h3", "h4"}:
             self._heading = True
             self._heading_text = []
-        elif tag.lower() == "ol" and self._pending_notice_list and self._list_depth == 0:
+        elif tag.lower() in {"ol", "ul"} and self._pending_notice_list and self._list_depth == 0:
             self._list_depth = 1
+            self._list_tag = tag.lower()
             self._pending_notice_list = False
-        elif tag.lower() == "ol" and self._list_depth:
+        elif tag.lower() in {"ol", "ul"} and self._list_depth:
             self._list_depth += 1
         elif tag.lower() == "a" and self._list_depth:
             self._anchor = (attrs_map.get("href", ""), [])
@@ -350,6 +402,10 @@ class _ThaparNoticeLinks(HTMLParser):
     def handle_data(self, data: str):
         if self._heading:
             self._heading_text.append(data)
+        # On /students/pages/student-notices the section label is a plain text
+        # node (NOTICE), not an h2/h3/h4 element.
+        if not self._list_depth and " ".join(data.split()).upper() in {"NOTICE", "NOTICES"}:
+            self._pending_notice_list = True
         if self._anchor is not None:
             self._anchor[1].append(data)
 
@@ -365,8 +421,10 @@ class _ThaparNoticeLinks(HTMLParser):
             if href and title:
                 self.links.append((href, title))
             self._anchor = None
-        elif lower == "ol" and self._list_depth:
+        elif lower in {"ol", "ul"} and self._list_depth:
             self._list_depth -= 1
+            if self._list_depth == 0:
+                self._list_tag = None
 
 
 class _PdfNoticeLinks(HTMLParser):
@@ -601,14 +659,191 @@ class _LiveAdapter(InstitutionAdapter):
         self.base_url = f"https://{next(iter(allowed_hosts))}"
         self.allowed_hosts = allowed_hosts
         self.errors = []
+        self.not_modified_count = 0
         self.backfill_cursor: str | None = None
         self.backfill_complete = False
         self.backfill_next_cursor: str | None = None
+        self.source_snapshot_keys: set[str] = set()
+        self.source_snapshot_complete = False
+        self.snapshot_cursor: str | None = None
+        self.source_snapshot_cursor: str | None = None
+        self._drive_access_token: str | None = None
+        self.document_validators: dict[str, dict[str, str | None]] = {}
         self.client = PublicSiteClient(allowed_hosts)
+
+    @staticmethod
+    def _drive_file_id(url: str) -> str | None:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname != "drive.google.com" or parsed.username or parsed.password:
+            return None
+        match = re.fullmatch(r"/file/d/([A-Za-z0-9_-]+)/view/?", parsed.path)
+        return match.group(1) if match else None
+
+    def _drive_pdf(self, url: str, title: str, date: str | None = None):
+        """Download a catalog-linked Drive PDF through Google's read-only API."""
+        file_id = self._drive_file_id(url)
+        if self.slug != "university-of-delhi" or not file_id:
+            return None
+        from finalsay.config import get_settings
+
+        credential_file = get_settings().google_drive_service_account_file
+        if not credential_file:
+            self.errors.append(
+                "Google Drive attachment needs FINALSAY_GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE "
+                "with read access to the official file; catalog metadata retained"
+            )
+            return None
+        try:
+            if self._drive_access_token is None:
+                from google.auth.transport.requests import Request
+                from google.oauth2.service_account import Credentials
+
+                credentials = Credentials.from_service_account_file(
+                    credential_file,
+                    scopes=["https://www.googleapis.com/auth/drive.readonly"],
+                )
+                credentials.refresh(Request())
+                self._drive_access_token = credentials.token
+
+            import requests
+
+            target = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+            headers = {"Authorization": f"Bearer {self._drive_access_token}"}
+            validators = self.document_validators.get(url, {})
+            if validators.get("etag"):
+                headers["If-None-Match"] = validators["etag"]
+            for attempt in range(4):
+                try:
+                    response = requests.get(
+                        target,
+                        headers=headers if attempt == 0 else {},
+                        stream=True,
+                        allow_redirects=False,
+                        timeout=(8, 15),
+                    )
+                except Exception as exc:
+                    if attempt < 2:
+                        time.sleep(0.5 * (2**attempt))
+                        continue
+                    raise SourceFetchError(
+                        f"Google Drive request failed: {type(exc).__name__}: {str(exc)[:120]}"
+                    ) from exc
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    response.close()
+                    if not location or attempt >= 3:
+                        raise SourceFetchError("Google Drive media redirect was invalid")
+                    target = urljoin(target, location)
+                    redirect = urlsplit(target)
+                    host = (redirect.hostname or "").lower()
+                    is_google_media_host = (
+                        host == "drive.usercontent.google.com"
+                        or host.endswith(".googleusercontent.com")
+                    )
+                    if redirect.scheme != "https" or not is_google_media_host:
+                        raise SourceFetchError("Google Drive redirected outside its media hosts")
+                    if not _host_is_public(host):
+                        raise SourceFetchError("Google Drive media host did not resolve publicly")
+                    continue
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                    response.close()
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                if response.status_code == 304 and validators:
+                    response.close()
+                    return None
+                if response.status_code != 200:
+                    status = response.status_code
+                    response.close()
+                    if status in {401, 403}:
+                        raise SourceFetchError(
+                            "Google Drive denied read access; share the official PDF with the "
+                            "configured service account or make it publicly readable"
+                        )
+                    if status == 404:
+                        raise SourceFetchError(
+                            "Google Drive returned HTTP 404 for the linked official PDF"
+                        )
+                    raise SourceFetchError(f"Google Drive API returned HTTP {status}")
+                with response:
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    source_etag = response.headers.get("ETag")
+                    source_last_modified = response.headers.get("Last-Modified")
+                    length = response.headers.get("Content-Length")
+                    if length and int(length) > MAX_PDF_BYTES:
+                        raise SourceFetchError(f"response exceeded {MAX_PDF_BYTES} bytes")
+                    chunks: list[bytes] = []
+                    size = 0
+                    deadline = time.monotonic() + MAX_RESPONSE_SECONDS
+                    for chunk in response.iter_content(chunk_size=RESPONSE_CHUNK_BYTES):
+                        if not chunk:
+                            continue
+                        if time.monotonic() >= deadline:
+                            raise SourceFetchError(
+                                f"response exceeded {MAX_RESPONSE_SECONDS}-second time limit"
+                            )
+                        size += len(chunk)
+                        if size > MAX_PDF_BYTES:
+                            raise SourceFetchError(f"response exceeded {MAX_PDF_BYTES} bytes")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                if not data or ("pdf" not in content_type and not data.startswith(b"%PDF")):
+                    raise SourceFetchError("Google Drive response was not a PDF")
+                body = _pdf_text(data)
+                if not body:
+                    self.errors.append(f"PDF had no extractable text: {url[:200]}")
+                publication_date = date or _publication_date(body)
+                fields = [f"Issued by: {self.name}", f"Subject: {title}"]
+                if body:
+                    fields.append(body)
+                return RawNotice(
+                    text="\\n".join(fields),
+                    source_url=url,
+                    institution_slug=self.slug,
+                    external_id=url,
+                    metadata={
+                        "title": title[:500],
+                        "source_date": publication_date,
+                        "attachment_url": url,
+                        "extraction_quality": "extracted" if body else "unextractable",
+                        "source_content_sha256": hashlib.sha256(data).hexdigest(),
+                        "source_etag": source_etag,
+                        "source_last_modified": source_last_modified,
+                    },
+                )
+            raise SourceFetchError("Google Drive media redirect limit exceeded")
+        except SourceFetchError as exc:
+            self.errors.append(f"{exc}: {url[:200]}")
+            return None
+        except Exception as exc:  # one inaccessible Drive file must not stop its source
+            self.errors.append(
+                f"Google Drive PDF retrieval failed ({type(exc).__name__}): {str(exc)[:140]}"
+            )
+            return None
 
     def _document(self, url: str, title: str, date: str | None = None, external_id: str | None = None):
         try:
-            _final_url, headers, data = self.client.get(url, MAX_PDF_BYTES)
+            validators = self.document_validators.get(url, {})
+            conditional_headers = {}
+            if validators.get("etag"):
+                conditional_headers["If-None-Match"] = validators["etag"]
+            if validators.get("last_modified"):
+                conditional_headers["If-Modified-Since"] = validators["last_modified"]
+            _final_url, headers, data = self.client.get(
+                url,
+                MAX_PDF_BYTES,
+                request_headers=conditional_headers,
+                allow_not_modified=bool(conditional_headers),
+            )
+        except SourceNotModified:
+            self.not_modified_count += 1
+            return None
+        except Exception as exc:  # noqa: BLE001 - one bad attachment must not stop its source
+            self.errors.append(
+                f"{type(exc).__name__}: {str(exc)[:180]} for attachment {url[:240]}"
+            )
+            return None
+        try:
             content_type = headers.get("Content-Type", "").lower()
             path = urlsplit(url).path.lower()
             is_pdf = "pdf" in content_type or path.endswith(".pdf")
@@ -642,6 +877,9 @@ class _LiveAdapter(InstitutionAdapter):
                     "source_date": publication_date,
                     "extraction_quality": "extracted" if body else "unextractable",
                     "source_content_sha256": hashlib.sha256(data).hexdigest(),
+                    "attachment_url": url,
+                    "source_etag": headers.get("ETag"),
+                    "source_last_modified": headers.get("Last-Modified"),
                 },
             )
         except Exception as exc:  # noqa: BLE001 - one bad PDF must not stop a source
@@ -654,21 +892,33 @@ class _LiveAdapter(InstitutionAdapter):
 class ThaparNoticeAdapter(_LiveAdapter):
     def fetch(self) -> list[RawNotice]:
         self.errors.clear()
+        self.skipped_external_links: list[str] = []
+        self.not_modified_count = 0
+        self.source_listing_count = 0
         final_url, _headers, body = self.client.get(self.source_url, MAX_HTML_BYTES)
         parser = _ThaparNoticeLinks()
         parser.feed(body.decode("utf-8", "replace"))
+        self.source_snapshot_keys = set()
+        self.source_snapshot_complete = False
         notices = []
         for href, title in parser.links[:MAX_NOTICES_PER_SOURCE]:
             href = quote(html.unescape(href).strip(), safe="/%:@?&=+#")
             url = urljoin(final_url, href)
             if urlsplit(url).hostname not in self.allowed_hosts:
-                self.errors.append(f"skipped cross-host notice link: {url}")
+                # External short links are intentionally not followed: they
+                # are outside this source's host allowlist, and skipping one
+                # should not mark the successfully fetched first-party notice
+                # list as a failed poll.
+                self.skipped_external_links.append(url)
                 continue
             if not url.lower().split("?", 1)[0].endswith(".pdf"):
                 continue
+            self.source_listing_count += 1
+            self.source_snapshot_keys.add(url)
             notice = self._document(url, title, external_id=url)
             if notice is not None:
                 notices.append(notice)
+        self.source_snapshot_complete = bool(parser.links) and len(parser.links) <= MAX_NOTICES_PER_SOURCE
         return notices
 
 
@@ -682,6 +932,8 @@ class NitjAcademicAdapter(_LiveAdapter):
             raise SourceFetchError(f"NITJ notice API returned invalid JSON: {exc}") from exc
         if not isinstance(entries, list):
             raise SourceFetchError("NITJ notice API response was not a list")
+        self.source_snapshot_keys = set()
+        self.source_snapshot_complete = False
         notices = []
         for entry in entries[:MAX_NOTICES_PER_SOURCE]:
             if not isinstance(entry, dict):
@@ -694,15 +946,18 @@ class NitjAcademicAdapter(_LiveAdapter):
             if urlsplit(url).hostname not in self.allowed_hosts:
                 self.errors.append(f"skipped cross-host notice link: {url}")
                 continue
+            external_id = str(entry.get("ref_no") or url)
+            self.source_snapshot_keys.add(external_id)
             date = str(entry.get("date") or "").strip() or None
             notice = self._document(
                 url,
                 title,
                 date=date,
-                external_id=str(entry.get("ref_no") or url),
+                external_id=external_id,
             )
             if notice is not None:
                 notices.append(notice)
+        self.source_snapshot_complete = bool(entries) and len(entries) <= MAX_NOTICES_PER_SOURCE
         return notices
 
 
@@ -714,6 +969,8 @@ class IitbAcademicAdapter(_LiveAdapter):
         final_url, _headers, body = self.client.get(self.source_url, MAX_HTML_BYTES)
         parser = _PdfNoticeLinks()
         parser.feed(body.decode("utf-8", "replace"))
+        self.source_snapshot_keys = set()
+        self.source_snapshot_complete = False
         notices = []
         for href, title in parser.links:
             if len(notices) >= MAX_NOTICES_PER_SOURCE:
@@ -724,9 +981,11 @@ class IitbAcademicAdapter(_LiveAdapter):
             if urlsplit(url).hostname not in IITB_HOSTS:
                 self.errors.append(f"skipped cross-host notice link: {url}")
                 continue
+            self.source_snapshot_keys.add(url)
             notice = self._document(url, title, external_id=url)
             if notice is not None:
                 notices.append(notice)
+        self.source_snapshot_complete = bool(parser.links) and len(parser.links) <= MAX_NOTICES_PER_SOURCE
         return notices
 
 
@@ -845,9 +1104,97 @@ class _PaginatedCatalogAdapter(_LiveAdapter):
         self.backfill_complete = self.backfill_next_cursor is None
         return pages
 
+    def _complete_catalog_snapshot(self, start_url: str, first_html: bytes) -> None:
+        """Collect listing keys in bounded, resumable slices.
+
+        A removal is recorded only after all slices are accumulated and the
+        catalog crawl reaches its end. A normal hourly poll reads at most five
+        pages here rather than walking hundreds of pages on every run.
+        """
+        self.source_snapshot_keys = set()
+        self.source_snapshot_complete = False
+        self.source_snapshot_cursor = None
+        current_url = self.snapshot_cursor or start_url
+        body = first_html
+        if self.snapshot_cursor:
+            try:
+                current_url, _headers, body = self.client.get(
+                    self.snapshot_cursor, MAX_HTML_BYTES
+                )
+            except Exception as exc:  # keep the checkpoint so this slice retries
+                self.errors.append(
+                    f"catalog snapshot page failed for {self.snapshot_cursor}: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+                self.source_snapshot_cursor = self.snapshot_cursor
+                return
+        visited: set[str] = set()
+        for _page_number in range(CATALOG_SNAPSHOT_PAGES_PER_POLL):
+            if current_url in visited:
+                self.errors.append("catalog snapshot stopped at a repeated pagination URL")
+                return
+            visited.add(current_url)
+            parser = _CatalogRows()
+            parser.feed(body.decode("utf-8", "replace"))
+            for href, title, _row_text in parser.items:
+                notice_url = urljoin(
+                    current_url,
+                    quote(html.unescape(href).strip(), safe="/%:@?&=+#"),
+                )
+                parsed = urlsplit(notice_url)
+                if parsed.hostname not in self.allowed_hosts:
+                    # Delhi's official catalog links some notices to Drive.
+                    # Index that URL as a catalog key without requesting it;
+                    # the fetch path still enforces the host allowlist.
+                    if self.include_all_catalog_rows:
+                        self.source_snapshot_keys.add(notice_url)
+                    continue
+                if self.slug == "vtu":
+                    if parsed.fragment:
+                        notice_url = parsed._replace(fragment="").geturl()
+                        parsed = urlsplit(notice_url)
+                    if parsed.path.lower().endswith(".pdf") or re.search(
+                        r"/\d{4}/\d{1,2}/\d+/?$", parsed.path
+                    ):
+                        self.source_snapshot_keys.add(notice_url)
+                    continue
+                looks_like_document = (
+                    parsed.path.lower().endswith(".pdf")
+                    or "/file/d/" in parsed.path.lower()
+                    or any(token in parsed.path.lower() for token in ("attachment", "download", "view"))
+                    or any(token in title.lower() for token in ("pdf", "download", "circular"))
+                )
+                if looks_like_document or self.include_all_catalog_rows:
+                    self.source_snapshot_keys.add(notice_url)
+
+            next_url = self._next_page(current_url, parser.pages)
+            if next_url is None:
+                self.source_snapshot_complete = True
+                self.source_snapshot_cursor = None
+                return
+            if urlsplit(next_url).hostname not in self.allowed_hosts:
+                self.errors.append("catalog snapshot pagination left the source host allowlist")
+                return
+            if _page_number + 1 >= CATALOG_SNAPSHOT_PAGES_PER_POLL:
+                self.source_snapshot_cursor = next_url
+                return
+            try:
+                current_url, _headers, body = self.client.get(next_url, MAX_HTML_BYTES)
+            except Exception as exc:  # noqa: BLE001 - retain all records, but do not infer removals
+                self.errors.append(
+                    f"catalog snapshot page failed for {next_url}: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+                self.source_snapshot_cursor = next_url
+                return
+        self.errors.append(
+            f"catalog snapshot exceeded the {MAX_CATALOG_SNAPSHOT_PAGES}-page safety limit"
+        )
+
     def fetch(self) -> list[RawNotice]:
         self.errors.clear()
         final_url, _headers, first_html = self.client.get(self.source_url, MAX_HTML_BYTES)
+        self._complete_catalog_snapshot(final_url, first_html)
         pages = self._catalog_urls(final_url, first_html)
         records: dict[str, RawNotice] = {}
         notice_limit = getattr(self, "notice_limit", MAX_NOTICES_PER_SOURCE)
@@ -884,9 +1231,11 @@ class _PaginatedCatalogAdapter(_LiveAdapter):
                 if parsed.hostname in self.allowed_hosts and looks_like_document:
                     notice = self._document(document_url, title, date=publication_date, external_id=document_url)
                 else:
-                    notice = None
-                    if parsed.hostname not in self.allowed_hosts:
-                        self.errors.append(f"attachment is hosted outside the institution allowlist; indexed catalog metadata only: {document_url[:200]}")
+                    notice = self._drive_pdf(document_url, title, date=publication_date)
+                    if parsed.hostname not in self.allowed_hosts and notice is None and not self._drive_file_id(document_url):
+                        self.errors.append(
+                            f"unsupported external attachment host; indexed catalog metadata only: {document_url[:200]}"
+                        )
                 if notice is None:
                     # Keep notices whose official catalog links to a broken PDF,
                     # but report reduced extraction in the source run.
@@ -899,6 +1248,7 @@ class _PaginatedCatalogAdapter(_LiveAdapter):
                         metadata={
                             "title": title,
                             "source_date": publication_date,
+                            "attachment_url": document_url,
                             "extraction_quality": "listing_only",
                         },
                     )
@@ -909,7 +1259,9 @@ class _PaginatedCatalogAdapter(_LiveAdapter):
 class VtuExaminationAdapter(_PaginatedCatalogAdapter):
     """VTU's public WordPress Examination category and PDF attachments."""
 
-    notice_limit = 20
+    # Keep the latest page responsive while advancing older backfill gradually.
+    notice_limit = 10
+    backfill_notice_limit = 5
 
     def fetch_post(self, post_url: str, title: str, listing_text: str = "") -> RawNotice:
         """Fetch one known VTU post and extract only its official attachments."""
@@ -923,6 +1275,8 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
         texts: list[str] = []
         extraction_qualities: list[str] = []
         source_file: str | None = None
+        source_etag: str | None = None
+        source_last_modified: str | None = None
         unique_attachments: dict[str, str] = {}
         for href, attachment_title in attachments.links:
             normalized = urljoin(detail_url, html.unescape(href))
@@ -943,6 +1297,8 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                 texts.append(raw.text)
                 extraction_qualities.append(raw.metadata.get("extraction_quality", "unknown"))
                 source_file = source_file or attachment_url
+                source_etag = source_etag or raw.metadata.get("source_etag")
+                source_last_modified = source_last_modified or raw.metadata.get("source_last_modified")
         if not texts:
             self.errors.append(f"VTU notice has no extractable attachment: {post_url}")
             texts = [listing_text or title]
@@ -960,6 +1316,8 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                 "title": title[:500],
                 "source_date": publication_date,
                 "attachment_url": source_file,
+                "source_etag": source_etag,
+                "source_last_modified": source_last_modified,
                 "extraction_quality": extraction_quality,
             },
         )
@@ -967,11 +1325,16 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
     def fetch(self) -> list[RawNotice]:
         self.errors.clear()
         final_url, _headers, first_html = self.client.get(self.source_url, MAX_HTML_BYTES)
+        self._complete_catalog_snapshot(final_url, first_html)
         pages = self._catalog_urls(final_url, first_html)
         records: dict[str, RawNotice] = {}
-        for page_url, body in pages:
+        for page_index, (page_url, body) in enumerate(pages):
             listing = _CatalogRows()
             listing.feed(body.decode("utf-8", "replace"))
+            page_limit = (
+                self.notice_limit if page_index == 0 else self.backfill_notice_limit
+            )
+            processed_from_page = 0
             for href, listing_title, listing_text in listing.items:
                 post_url = urljoin(page_url, html.unescape(href))
                 parsed = urlsplit(post_url)
@@ -984,18 +1347,22 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                     post_url = parsed._replace(fragment="").geturl()
                     parsed = urlsplit(post_url)
                 if parsed.path.lower().endswith(".pdf"):
+                    if processed_from_page >= page_limit:
+                        self.errors.append(f"notice cap reached ({page_limit})")
+                        break
                     notice = self._document(
                         post_url, listing_title, _listing_date(listing_text), post_url
                     )
                     if notice is not None:
                         records[post_url] = notice
+                        processed_from_page += 1
                     continue
                 if not re.search(r"/\d{4}/\d{1,2}/\d+/?$", parsed.path):
                     continue
                 if post_url in records:
                     continue
-                if len(records) >= self.notice_limit:
-                    self.errors.append(f"notice cap reached ({self.notice_limit})")
+                if processed_from_page >= page_limit:
+                    self.errors.append(f"notice cap reached ({page_limit})")
                     break
                 try:
                     notice = self.fetch_post(post_url, listing_title, listing_text)
@@ -1016,6 +1383,7 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                     else:
                         continue
                 records[post_url] = notice
+                processed_from_page += 1
         return list(records.values())
 
 
@@ -1034,13 +1402,18 @@ class DuExaminationAdapter(_PaginatedCatalogAdapter):
 class MumbaiCircularAdapter(_PaginatedCatalogAdapter):
     """University of Mumbai public circular register."""
 
-    notice_limit = 25
+    notice_limit = 10
 
     def fetch(self) -> list[RawNotice]:
         self.errors.clear()
         final_url, _headers, body = self.client.get(self.source_url, MAX_HTML_BYTES)
         parser = _MumbaiCircularRows()
         parser.feed(body.decode("utf-8", "replace"))
+        self.source_snapshot_keys = {f"mumbai:{item[2]}" for item in parser.items}
+        # This endpoint returns the complete circular register in one table.
+        # An empty parse is treated as an unknown page shape, never as proof
+        # that every previously collected circular was removed.
+        self.source_snapshot_complete = bool(parser.items)
         notices: list[RawNotice] = []
         recent_items = parser.items[:self.notice_limit]
         cursor = self.backfill_cursor
@@ -1053,11 +1426,11 @@ class MumbaiCircularAdapter(_PaginatedCatalogAdapter):
                 None,
             )
             if cursor_index is None:
-                self.errors.append(
-                    f"Mumbai backfill cursor circular code is no longer in the source listing: {code[:80]}"
-                )
-                backfill_start = len(parser.items)
-                cursor_error = True
+                # The portal periodically removes old circular rows. A missing
+                # checkpoint must not pin backfill forever: restart from the
+                # first historical row still present after the latest window.
+                # Stable external IDs make replay idempotent in the database.
+                backfill_start = self.notice_limit
             else:
                 backfill_start = cursor_index + 1
         elif cursor and cursor.isdigit():
@@ -1128,6 +1501,7 @@ class MumbaiCircularAdapter(_PaginatedCatalogAdapter):
                     metadata={
                         "title": title[:500],
                         "source_date": publication_date,
+                        "attachment_url": attachment,
                         "extraction_quality": "listing_only",
                     },
                 )
@@ -1140,9 +1514,6 @@ class MumbaiCircularAdapter(_PaginatedCatalogAdapter):
                 raw.metadata["title"] = title[:500]
                 raw.metadata["source_date"] = publication_date
             notices.append(raw)
-        if not self.backfill_complete and self.backfill_next_cursor and not cursor_error:
-            cursor_label = self.backfill_next_cursor.removeprefix("mumbai-code:")
-            self.errors.append(f"backfill continuing after circular code {cursor_label[:80]}")
         return notices
 
 

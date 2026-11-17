@@ -146,6 +146,10 @@ class NoticeSummary(BaseModel):
     source_url: str | None = None
     source_key: str | None = None
     extraction_quality: str = "unknown"
+    source_state: str = "active"
+    source_last_seen_at: datetime | None = None
+    source_removed_at: datetime | None = None
+    admin_status: str = "active"
     version_no: int = 1
     is_current: bool = True
     previous_version_id: int | None = None
@@ -198,8 +202,41 @@ class FetchResponse(BaseModel):
     created: int
     modified: int = 0
     skipped: int
+    removed: int = 0
     errors: int = 0
     institutions: list[dict]
+
+
+class ScrapeScheduleOut(BaseModel):
+    interval_seconds: int
+    status: str = "idle"
+    last_attempted_at: datetime | None = None
+    last_completed_at: datetime | None = None
+    next_scheduled_at: datetime | None = None
+    last_error: str | None = None
+
+
+class ScrapeScheduleUpdate(BaseModel):
+    interval_seconds: int = Field(ge=1_800, le=21_600, multiple_of=300)
+
+
+class AdminNoticeOut(NoticeSummary):
+    redacted_text: str | None = None
+    admin_review_note: str | None = None
+    admin_reviewed_at: datetime | None = None
+    admin_reviewed_by: int | None = None
+
+
+class AdminNoticePage(BaseModel):
+    items: list[AdminNoticeOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminNoticeReviewUpdate(BaseModel):
+    status: Literal["active", "flagged", "archived", "rejected"]
+    note: str | None = Field(default=None, max_length=1_000)
 
 
 class InstitutionCreate(BaseModel):

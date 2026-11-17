@@ -26,8 +26,18 @@ _COLUMNS: dict[str, dict[str, str]] = {
         "published_date": "VARCHAR(80)",
         "published_on": "DATE",
         "source_key": "VARCHAR(500)",
+        "source_document_url": "VARCHAR(1000)",
+        "source_etag": "VARCHAR(500)",
+        "source_last_modified": "VARCHAR(200)",
         "source_content_sha256": "VARCHAR(64)",
         "extraction_quality": "VARCHAR(24) NOT NULL DEFAULT 'unknown'",
+        "source_state": "VARCHAR(20) NOT NULL DEFAULT 'active'",
+        "source_last_seen_at": "TIMESTAMP",
+        "source_removed_at": "TIMESTAMP",
+        "admin_status": "VARCHAR(20) NOT NULL DEFAULT 'active'",
+        "admin_review_note": "TEXT",
+        "admin_reviewed_at": "TIMESTAMP",
+        "admin_reviewed_by": "INTEGER REFERENCES user(id)",
         "version_no": "INTEGER NOT NULL DEFAULT 1",
         "is_current": "BOOLEAN NOT NULL DEFAULT TRUE",
         "previous_version_id": "INTEGER",
@@ -47,6 +57,11 @@ _COLUMNS: dict[str, dict[str, str]] = {
     },
     "benchmark_annotation": {
         "user_id": "INTEGER REFERENCES user(id)",
+    },
+    "scrape_progress": {
+        "snapshot_cursor": "VARCHAR(1000)",
+        "snapshot_keys_json": "TEXT NOT NULL DEFAULT '[]'",
+        "snapshot_completed_at": "TIMESTAMP",
     },
 }
 

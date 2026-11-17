@@ -13,6 +13,7 @@ Only redacted text and extracted fields are ever persisted (GC-5, R2.4).
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 import re
 
@@ -28,6 +29,15 @@ from finalsay.services.provenance import sha256_notice
 
 _TITLE_LINE_RE = re.compile(
     r"^\s*['\"`‘’“”*•>\-]*\s*(?:subject|title)\s*[:\-]\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+# Results notices from the DU examination portal commonly have no "Subject:"
+# line. Their OCR begins with a standalone uppercase course heading followed by
+# "EXAMINATION, YYYY"; retaining that heading is essential for matching the
+# exact official portal listing.
+_COURSE_EXAM_HEADING_RE = re.compile(
+    r"^\s*((?:certificate|diploma)\s+course\s+in\s+.+?)\s+"
+    r"examinations?(?:\s*[,;:]?\s*(?:20\d{2})?)?\s*$",
     re.IGNORECASE,
 )
 _TITLE_CONTINUATION_STOP_RE = re.compile(
@@ -67,6 +77,11 @@ def _extract_title(text: str | None) -> str | None:
             parts.append(clean.strip().strip("\"'`‘’“”.,;:"))
         title = " ".join(part for part in parts if part)
         return title[:500] or None
+    for line in lines:
+        match = _COURSE_EXAM_HEADING_RE.match(line.strip())
+        if match:
+            title = re.sub(r"\s+", " ", match.group(1)).strip(" \t.,;:-")
+            return title[:500] or None
     return None
 
 
@@ -203,6 +218,10 @@ def upsert_official(
             ).order_by(Notice.version_no.desc())
         )
     if current is not None:
+        current.source_state = "active"
+        current.source_last_seen_at = datetime.now(timezone.utc)
+        current.source_removed_at = None
+    if current is not None:
         current_source_hash = current.source_content_sha256
         same_source_file = bool(
             incoming_source_hash
@@ -259,6 +278,9 @@ def upsert_official(
         )
         if existing is not None:
             existing.retrieved_at = datetime.now(timezone.utc)
+            existing.source_state = "active"
+            existing.source_last_seen_at = datetime.now(timezone.utc)
+            existing.source_removed_at = None
             if _QUALITY_RANK.get(incoming_quality, 1) > _QUALITY_RANK.get(
                 existing.extraction_quality or "unknown", 1
             ):
@@ -298,6 +320,8 @@ def upsert_official(
         source_key=source_key,
         source_content_sha256=incoming_source_hash,
         extraction_quality=incoming_quality,
+        source_state="active",
+        source_last_seen_at=datetime.now(timezone.utc),
         version_no=version_no,
         is_current=True,
         previous_version_id=previous_id,
@@ -309,6 +333,42 @@ def upsert_official(
     _store_fields(db, notice, result)
     db.flush()
     return notice, outcome
+
+
+def _apply_source_snapshot(db: Session, institution: Institution, adapter) -> int:
+    """Mark missing current records removed only after a complete source scan."""
+    if not getattr(adapter, "source_snapshot_complete", False):
+        return 0
+    observed_keys = {
+        extraction.normalize_unicode_text(str(key))
+        for key in getattr(adapter, "source_snapshot_keys", set())
+        if key
+    }
+    if not observed_keys:
+        # An empty parse can mean the portal changed its markup. Never infer
+        # that the institution removed its whole catalogue from that alone.
+        return 0
+    rows = db.scalars(
+        select(Notice).where(
+            Notice.kind == "official",
+            Notice.institution_id == institution.id,
+            Notice.is_current.is_(True),
+            Notice.source_key.is_not(None),
+            Notice.extraction_quality != "issuer_submitted",
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    removed = 0
+    for notice in rows:
+        if notice.source_key in observed_keys:
+            notice.source_state = "active"
+            notice.source_last_seen_at = now
+            notice.source_removed_at = None
+        elif notice.source_state != "removed":
+            notice.source_state = "removed"
+            notice.source_removed_at = now
+            removed += 1
+    return removed
 
 
 def fetch_all(
@@ -327,7 +387,7 @@ def fetch_all(
     Scheduled callers may commit each institution separately so a later source
     failure or process restart does not discard earlier successful source work.
     """
-    summary: dict = {"created": 0, "modified": 0, "skipped": 0, "errors": 0, "institutions": []}
+    summary: dict = {"created": 0, "modified": 0, "skipped": 0, "removed": 0, "errors": 0, "institutions": []}
     provenance_days: set[str] = set()
     from finalsay.adapters.live import create_live_adapter
 
@@ -365,6 +425,23 @@ def fetch_all(
         if configured_source is not None and adapter is None:
             try:
                 adapter = create_live_adapter(configured_source)
+                document_rows = db.execute(
+                    select(
+                        Notice.source_document_url,
+                        Notice.source_etag,
+                        Notice.source_last_modified,
+                    ).where(
+                        Notice.kind == "official",
+                        Notice.institution_id == configured_source.id,
+                        Notice.is_current.is_(True),
+                        Notice.source_document_url.is_not(None),
+                    )
+                ).all()
+                adapter.document_validators = {
+                    url: {"etag": etag, "last_modified": last_modified}
+                    for url, etag, last_modified in document_rows
+                    if etag or last_modified
+                }
                 if getattr(adapter, "supports_backfill", False):
                     progress = db.get(ScrapeProgress, configured_source.id)
                     if progress is None:
@@ -373,6 +450,7 @@ def fetch_all(
                         db.flush()
                     adapter.backfill_cursor = progress.cursor
                     adapter.backfill_complete = progress.backfill_complete
+                    adapter.snapshot_cursor = progress.snapshot_cursor
             except Exception as exc:  # noqa: BLE001 - report source config failures
                 error = f"{type(exc).__name__}: {str(exc)[:500]}"
                 summary["errors"] += 1
@@ -383,6 +461,7 @@ def fetch_all(
                     "created": 0,
                     "modified": 0,
                     "skipped": 0,
+                    "removed": 0,
                     "status": "error",
                     "error": error,
                 })
@@ -404,17 +483,30 @@ def fetch_all(
         institution = configured_source or get_or_create_institution(
             db, adapter.slug, adapter.name, adapter.base_url
         )
-        found = created = modified = skipped = 0
+        found = created = modified = skipped = removed = 0
         error = None
         started_at = datetime.now(timezone.utc)
         try:
             notices = adapter.fetch()
-            found = len(notices)
+            # Thapar's conditional PDF requests return no body for unchanged
+            # documents (HTTP 304), but those entries are still present in
+            # the successfully parsed listing and must be reflected in the
+            # scrape counters.
+            found = int(getattr(adapter, "source_listing_count", len(notices)))
             adapter_errors = getattr(adapter, "errors", [])
             if adapter_errors:
                 error = " | ".join(str(item)[:250] for item in adapter_errors[:8])
             for raw in notices:
                 _notice, outcome = upsert_official(db, raw, institution)
+                attachment_url = raw.metadata.get("attachment_url")
+                if attachment_url:
+                    _notice.source_document_url = str(attachment_url)[:1_000]
+                if raw.metadata.get("source_etag"):
+                    _notice.source_etag = str(raw.metadata["source_etag"])[:500]
+                if raw.metadata.get("source_last_modified"):
+                    _notice.source_last_modified = str(
+                        raw.metadata["source_last_modified"]
+                    )[:200]
                 if outcome == "created":
                     created += 1
                     provenance_days.add(_notice.created_at.strftime("%Y-%m-%d"))
@@ -423,13 +515,36 @@ def fetch_all(
                     provenance_days.add(_notice.created_at.strftime("%Y-%m-%d"))
                 else:
                     skipped += 1
+            skipped += int(getattr(adapter, "not_modified_count", 0))
+            progress = None
             if configured_source is not None and getattr(adapter, "supports_backfill", False):
                 progress = db.get(ScrapeProgress, configured_source.id)
                 if progress is None:
                     progress = ScrapeProgress(institution_id=configured_source.id)
                     db.add(progress)
+                    db.flush()
+                try:
+                    prior_snapshot_keys = set(json.loads(progress.snapshot_keys_json or "[]"))
+                except (TypeError, ValueError):
+                    prior_snapshot_keys = set()
+                combined_snapshot_keys = prior_snapshot_keys | set(
+                    getattr(adapter, "source_snapshot_keys", set())
+                )
+                adapter.source_snapshot_keys = combined_snapshot_keys
+            removed = _apply_source_snapshot(db, institution, adapter)
+            if configured_source is not None and getattr(adapter, "supports_backfill", False):
+                assert progress is not None
                 progress.cursor = adapter.backfill_next_cursor
                 progress.backfill_complete = bool(adapter.backfill_complete)
+                if adapter.source_snapshot_complete:
+                    progress.snapshot_cursor = None
+                    progress.snapshot_keys_json = "[]"
+                    progress.snapshot_completed_at = datetime.now(timezone.utc)
+                else:
+                    progress.snapshot_cursor = adapter.source_snapshot_cursor
+                    progress.snapshot_keys_json = json.dumps(
+                        sorted(adapter.source_snapshot_keys), ensure_ascii=False
+                    )
                 progress.updated_at = datetime.now(timezone.utc)
         except Exception as exc:  # keep other institution sources running
             error = f"{type(exc).__name__}: {str(exc)[:500]}"
@@ -441,6 +556,7 @@ def fetch_all(
         summary["created"] += created
         summary["modified"] += modified
         summary["skipped"] += skipped
+        summary["removed"] += removed
         summary["errors"] += int(error is not None)
         institution_result = {
             "slug": adapter.slug,
@@ -449,6 +565,7 @@ def fetch_all(
             "created": created,
             "modified": modified,
             "skipped": skipped,
+            "removed": removed,
             "status": status,
             "error": error,
         }

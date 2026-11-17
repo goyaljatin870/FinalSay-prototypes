@@ -19,6 +19,7 @@ const NAV: NavItem[] = [
   { to: '/reviewer/queue', label: 'Queue', roles: ['reviewer', 'admin'] },
   { to: '/reviewer/benchmark', label: 'Benchmark', roles: ['reviewer'] },
   { to: '/admin/sources', label: 'Sources', roles: ['admin'] },
+  { to: '/admin/notices', label: 'Notice review', roles: ['admin'] },
   { to: '/admin/provenance', label: 'Integrity', roles: ['admin'] },
   { to: '/issuer/publish', label: 'Publish', roles: ['issuer'] },
 ]

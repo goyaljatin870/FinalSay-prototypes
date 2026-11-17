@@ -4,9 +4,10 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from threading import Event
 
-from finalsay.models import Institution, ScrapeRun
+from finalsay.models import Institution, ScrapeRun, ScrapeScheduleState
 from finalsay.services import scrape_runtime
 
 
@@ -15,6 +16,17 @@ class _FakeSession:
         self.committed = False
         self.rolled_back = False
         self.closed = False
+        self.rows = {}
+
+    def get(self, model, key):
+        return self.rows.get((model, key))
+
+    def add(self, item):
+        if isinstance(item, ScrapeScheduleState):
+            self.rows[(ScrapeScheduleState, item.id)] = item
+
+    def flush(self):
+        pass
 
     def commit(self):
         self.committed = True
@@ -132,6 +144,44 @@ def test_scheduler_persists_a_cycle_and_releases_the_shared_slot(monkeypatch):
     scrape_runtime.release_scrape_slot()
 
 
+def test_scheduler_waits_for_persisted_due_time_after_restart(monkeypatch):
+    class StopAfterWait:
+        def __init__(self):
+            self.delays = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            self.delays.append(timeout)
+            return True
+
+    session = _FakeSession()
+    due = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=30)
+    state = ScrapeScheduleState(id=1, status="ok", next_scheduled_at=due)
+    session.add(state)
+    monkeypatch.setattr(scrape_runtime, "SessionLocal", lambda: session)
+    stop = StopAfterWait()
+
+    assert scrape_runtime._wait_until_next_poll(stop, 3_600) is True
+    assert stop.delays == [60]
+    assert state.next_scheduled_at == due
+
+
+def test_interrupted_running_schedule_is_due_for_recovery(monkeypatch):
+    session = _FakeSession()
+    state = ScrapeScheduleState(
+        id=1,
+        status="running",
+        next_scheduled_at=datetime.now(timezone.utc).replace(tzinfo=None)
+        + timedelta(hours=1),
+    )
+    session.add(state)
+    monkeypatch.setattr(scrape_runtime, "SessionLocal", lambda: session)
+
+    assert scrape_runtime._wait_until_next_poll(Event(), 3_600) is False
+
+
 def test_scheduler_retries_failed_source_cycle_before_normal_interval(monkeypatch):
     class StopAfterWait:
         def __init__(self):
@@ -170,7 +220,9 @@ def test_scheduler_retries_failed_source_cycle_before_normal_interval(monkeypatc
         stop, 7_200, logging.getLogger("test-scraper-retry")
     )
 
-    assert stop.delays == [scrape_runtime._SOURCE_RETRY_BASE_SECONDS]
+    # The scheduler checks for persisted Admin interval changes at least once
+    # per minute while keeping the retry deadline at its configured delay.
+    assert stop.delays == [60]
     assert session.committed is True
     assert session.closed is True
 
@@ -219,10 +271,10 @@ def test_scheduler_keeps_normal_interval_for_expected_partial_results(monkeypatc
             "created": 0,
             "modified": 0,
             "skipped": 90,
-            "errors": 2,
+            "errors": 1,
             "institutions": [
                 {"slug": "delhi", "error": "attachment is hosted outside the institution allowlist"},
-                {"slug": "mumbai", "error": "backfill continuing after circular code 123"},
+                {"slug": "mumbai", "status": "ok", "error": None},
             ],
         },
     )
@@ -236,7 +288,7 @@ def test_scheduler_keeps_normal_interval_for_expected_partial_results(monkeypatc
         stop, 7_200, logging.getLogger("test-scraper-partial")
     )
 
-    assert stop.delays == [7_200]
+    assert stop.delays == [60]
     assert session.committed is True
     assert session.closed is True
 

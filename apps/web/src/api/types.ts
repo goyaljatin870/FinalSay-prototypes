@@ -62,6 +62,10 @@ export interface NoticeSummary {
   extraction_quality: string
   source_url: string | null
   source_key: string | null
+  source_state: 'active' | 'removed'
+  source_last_seen_at: string | null
+  source_removed_at: string | null
+  admin_status: 'active' | 'flagged' | 'archived' | 'rejected'
   version_no: number
   is_current: boolean
   previous_version_id: number | null
@@ -194,12 +198,48 @@ export interface BenchmarkCandidateOut {
   official_published_date: string | null
 }
 
+export interface InstitutionFetchResult {
+  slug: string
+  name: string
+  found: number
+  created: number
+  modified: number
+  skipped: number
+  removed: number
+  status: string
+  error: string | null
+}
+
 export interface FetchResponse {
   created: number
   modified: number
   skipped: number
+  removed: number
   errors: number
-  institutions: Array<Record<string, unknown>>
+  institutions: InstitutionFetchResult[]
+}
+
+export interface AdminNotice extends NoticeSummary {
+  redacted_text: string | null
+  admin_review_note: string | null
+  admin_reviewed_at: string | null
+  admin_reviewed_by: number | null
+}
+
+export interface AdminNoticePage {
+  items: AdminNotice[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface ScrapeSchedule {
+  interval_seconds: number
+  status: string
+  last_attempted_at: string | null
+  last_completed_at: string | null
+  next_scheduled_at: string | null
+  last_error: string | null
 }
 
 export interface ScrapeRunOut {

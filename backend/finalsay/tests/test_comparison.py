@@ -3,6 +3,8 @@ review_case creation, and relation-edge persistence with rationale."""
 
 from __future__ import annotations
 
+from datetime import date
+
 from sqlalchemy import select
 
 from finalsay.models import RelationEdge, ReviewCase, Notice
@@ -107,6 +109,41 @@ def test_model_unresolved_rationale_does_not_claim_high_score_is_below_threshold
     assert outcome.gated is True
     assert "routed to reviewer" in outcome.edge.rationale.lower()
     assert "below the threshold" not in outcome.edge.rationale.lower()
+
+
+def test_ocr_course_heading_retrieves_exact_du_listing_over_semantic_decoy(db_session):
+    target = _make_notice(
+        db_session,
+        "official",
+        "Issued by: University of Delhi Examination\n"
+        "Subject: Certificate Course in Tibetan Language\n"
+        "Official listing: Certificate Course in Tibetan Language",
+    )
+    target.title = "Certificate Course in Tibetan Language"
+    target.extraction_quality = "listing_only"
+    target.published_on = date(2026, 10, 7)
+    decoy = _make_notice(
+        db_session,
+        "official",
+        "Notification regarding last date for filling up examination forms.",
+    )
+    decoy.title = "Notification regarding Last date for Filling up Examination form"
+    decoy.published_on = date(2026, 11, 16)
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "UNIVERSITY OF DELHI\n\n"
+        "CERTIFICATE COURSE IN TIBETAN LANGUAGE EXAMINATION, 2026\n\n"
+        "The following Candidates are declared to have Passed the Examination",
+    )
+    submission.title = None
+
+    ranked = comparison.retrieve_candidates(db_session, submission, model=MockComparisonModel())
+
+    assert submission.title == "CERTIFICATE COURSE IN TIBETAN LANGUAGE"
+    assert ranked[0].notice.id == target.id
+    assert ranked[0].title_similarity == 1.0
+    assert ranked[1].notice.id == decoy.id
 
 
 def test_high_confidence_persists_edge_without_review_case(db_session):
@@ -314,6 +351,75 @@ def test_conflicting_schedule_dates_override_high_confidence_consistent_label(db
     assert outcome.review_case is not None
     assert "date safety check" in " ".join(outcome.evidence).lower()
     assert "dates conflict" in outcome.rationale.lower()
+
+
+def test_explicit_official_revision_supersedes_matching_old_date(db_session):
+    official = _make_notice(
+        db_session,
+        "official",
+        "The End-Semester Examinations were previously scheduled to commence on "
+        "30 November 2026. The examinations have been rescheduled and will now "
+        "commence on 5 December 2026 instead.",
+    )
+    official.title = "Revised Schedule for End-Semester Examinations"
+    official.extraction_quality = "extracted"
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "The End-Semester Examinations will commence from 30 November 2026.",
+    )
+    submission.title = "End-Semester Examination Schedule"
+
+    class _SharedOldDateTrap(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(official, 0.99, 0.99)]
+
+        def classify(self, _premise, _hypothesis):
+            # Models may select the identical old-date sentence and miss the
+            # revised date elsewhere in the official notice.
+            return "consistent", 0.99, "The shared old date is entailed."
+
+    outcome = comparison.classify_submission(
+        db_session, submission, model=_SharedOldDateTrap()
+    )
+
+    assert outcome.label == "superseded"
+    assert outcome.gated is False
+    assert outcome.review_case is None
+    assert "explicitly revises" in outcome.rationale.lower()
+    assert any("date safety check" in item.lower() for item in outcome.evidence)
+
+
+def test_revised_title_alone_does_not_turn_date_conflict_into_superseded(db_session):
+    official = _make_notice(
+        db_session,
+        "official",
+        "The End-Semester Examinations will commence on 5 December 2026.",
+    )
+    official.title = "Revised Schedule for End-Semester Examinations"
+    official.extraction_quality = "extracted"
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "The End-Semester Examinations will commence on 30 November 2026.",
+    )
+    submission.title = "End-Semester Examination Schedule"
+
+    class _DateConflictModel(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(official, 0.99, 0.99)]
+
+        def classify(self, _premise, _hypothesis):
+            return "consistent", 0.99, "The topic is related."
+
+    outcome = comparison.classify_submission(
+        db_session, submission, model=_DateConflictModel()
+    )
+
+    assert outcome.label == "unresolved"
+    assert outcome.gated is True
+    assert outcome.review_case is not None
+    assert "routed to reviewer" in outcome.rationale.lower()
 
 
 def test_unavailable_semantic_models_keep_candidate_and_route_to_review(db_session):

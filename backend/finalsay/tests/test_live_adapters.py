@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from threading import Event
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -11,6 +12,7 @@ from finalsay.adapters.live import (
     IitbAcademicAdapter,
     PublicSiteClient,
     SourceFetchError,
+    SourceNotModified,
     ThaparNoticeAdapter,
     VtuExaminationAdapter,
     DuExaminationAdapter,
@@ -18,6 +20,8 @@ from finalsay.adapters.live import (
     _CatalogRows,
     _read_bounded_response,
     _listing_date,
+    _pdf_text,
+    _publication_date,
     _MumbaiCircularRows,
     _ThaparNoticeLinks,
     validate_source_url,
@@ -47,6 +51,70 @@ def test_thapar_page_parser_only_selects_notice_list_links():
         "Auxiliary Examination (August, 2026)",
         "AC ODDSEM 2026-27 (UG-II, III, IV, PG)",
     ]
+
+
+def test_thapar_student_notices_parser_reads_plain_label_and_unordered_list():
+    parser = _ThaparNoticeLinks()
+    parser.feed((FIXTURES / "thapar-student-notices.html").read_text())
+    assert len(parser.links) == 9
+    assert parser.links[0] == (
+        "/upload/files/TIET-Hostel Retention Notice (EVEN 2026-27).pdf",
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+    )
+    assert parser.links[4] == ("https://t.ly/thapar_stud", "Student Notice of Thapar University")
+    assert parser.links[-1][1] == "New Health Centre Operating Hours"
+
+
+def test_thapar_student_notices_adapter_fetches_official_pdf_links(monkeypatch):
+    import finalsay.adapters.live as live
+
+    page_url = "https://www.thapar.edu/students/pages/student-notices"
+    adapter = ThaparNoticeAdapter("thapar", "Thapar University", page_url, {"www.thapar.edu"})
+    adapter.client = _FakeClient(
+        page_url, (FIXTURES / "thapar-student-notices.html").read_bytes()
+    )
+    monkeypatch.setattr(live, "_pdf_text", lambda _data: "Official student notice PDF text.")
+
+    notices = adapter.fetch()
+
+    assert len(notices) == 8
+    assert notices[0].metadata["title"] == "Hostel Retention Notice (EVEN Sem 2026-27)"
+    assert notices[-1].metadata["title"] == "New Health Centre Operating Hours"
+    assert all("Official student notice PDF text" in n.text for n in notices)
+    assert adapter.source_listing_count == 8
+    assert adapter.source_snapshot_complete is True
+    assert adapter.errors == []
+    assert adapter.skipped_external_links == ["https://t.ly/thapar_stud"]
+    assert all("t.ly" not in url for url, _size in adapter.client.calls)
+
+
+def test_real_thapar_pdf_fixture_extracts_text_and_ordinal_publication_date():
+    from finalsay.services.notice_dates import parse_publication_date
+
+    body = (FIXTURES / "thapar-hostel-retention.pdf").read_bytes()
+    text = _pdf_text(body)
+    assert "THAPAR INSTITUTE OF ENGINEERING & TECHNOLOGY" in text
+    assert "Hostel Retention & Fee Payment" in text
+    assert _publication_date(text) == "12th Nov 2026"
+    assert parse_publication_date(_publication_date(text)) is not None
+
+
+def test_thapar_adapter_counts_conditionally_unchanged_pdf_listings():
+    page_url = "https://www.thapar.edu/students/pages/student-notices"
+    page = b"<p>NOTICE</p><ul><li><a href='/one.pdf'>One</a></li><li><a href='/two.pdf'>Two</a></li></ul>"
+    adapter = ThaparNoticeAdapter("thapar", "Thapar University", page_url, {"www.thapar.edu"})
+    fake = _FakeClient(page_url, page)
+
+    def unchanged_get(url, max_bytes, **kwargs):
+        if url == page_url:
+            return fake.get(url, max_bytes, **kwargs)
+        raise SourceNotModified(url)
+
+    adapter.client.get = unchanged_get
+    assert adapter.fetch() == []
+    assert adapter.source_listing_count == 2
+    assert adapter.not_modified_count == 2
+    assert adapter.errors == []
 
 
 def test_thapar_adapter_extracts_pdf_text_and_metadata(monkeypatch):
@@ -233,6 +301,109 @@ def test_delhi_catalog_keeps_notice_rows_with_non_document_links():
     assert notices[0].metadata["extraction_quality"] == "listing_only"
 
 
+def test_catalog_snapshot_is_bounded_and_resumes_between_polls():
+    source_url = "https://exam.du.ac.in/exam/index.php/notifications"
+
+    def page_url(offset):
+        return source_url if offset == 0 else f"{source_url}?offset={offset}"
+
+    def page_html(offset):
+        next_link = f'<a href="{page_url(offset + 20)}">Next</a>' if offset < 100 else ""
+        row = (
+            f'<tr><td><a href="/uploads/{offset}.pdf">Notice {offset}</a></td></tr>'
+            if offset < 120 else ""
+        )
+        return f"<html><table>{row}</table>{next_link}</html>".encode()
+
+    class OffsetClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, target, _limit, **_kwargs):
+            self.calls.append(target)
+            offset = int(parse_qs(urlsplit(target).query).get("offset", [0])[0])
+            return target, {"Content-Type": "text/html"}, page_html(offset)
+
+    adapter = DuExaminationAdapter(
+        "university-of-delhi", "University of Delhi Examination", source_url,
+        {"exam.du.ac.in"},
+    )
+    client = OffsetClient()
+    adapter.client = client
+    adapter._complete_catalog_snapshot(source_url, page_html(0))
+
+    assert len(client.calls) == 4  # the current page plus at most four extra pages
+    assert adapter.source_snapshot_complete is False
+    assert adapter.source_snapshot_cursor == page_url(100)
+    first_slice = set(adapter.source_snapshot_keys)
+
+    adapter.snapshot_cursor = adapter.source_snapshot_cursor
+    adapter._complete_catalog_snapshot(source_url, page_html(0))
+
+    assert adapter.source_snapshot_complete is True
+    assert adapter.source_snapshot_cursor is None
+    assert len(first_slice | adapter.source_snapshot_keys) == 6
+
+
+def test_delhi_drive_pdf_uses_readonly_api_response(monkeypatch):
+    import sys
+    import types
+    import finalsay.adapters.live as live
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "application/pdf", "Content-Length": "9"}
+
+        def iter_content(self, chunk_size):
+            assert chunk_size == live.RESPONSE_CHUNK_BYTES
+            yield b"%PDF-test"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def close(self):
+            return None
+
+    requests_module = types.SimpleNamespace(get=lambda _url, **_kwargs: Response())
+    import finalsay.config as config
+
+    monkeypatch.setattr(
+        config, "get_settings",
+        lambda: types.SimpleNamespace(google_drive_service_account_file="/tmp/reader.json"),
+    )
+    adapter = DuExaminationAdapter(
+        "university-of-delhi", "University of Delhi Examination",
+        "https://exam.du.ac.in/exam/index.php/notifications", {"exam.du.ac.in"},
+    )
+    adapter._drive_access_token = "test-readonly-token"
+    monkeypatch.setitem(sys.modules, "requests", requests_module)
+    monkeypatch.setattr(live, "_pdf_text", lambda data: "Certificate Course in Tibetan Language, dated 07 October 2026")
+
+    notice = adapter._drive_pdf(
+        "https://drive.google.com/file/d/abc_123/view?usp=drive_link",
+        "Certificate Course in Tibetan Language",
+    )
+
+    assert notice is not None
+    assert notice.source_url.startswith("https://drive.google.com/file/d/abc_123/")
+    assert notice.metadata["extraction_quality"] == "extracted"
+    assert notice.metadata["source_content_sha256"]
+    assert "07 October 2026" in notice.text
+
+
+def test_drive_file_id_rejects_noncanonical_or_other_hosts():
+    adapter = DuExaminationAdapter(
+        "university-of-delhi", "University of Delhi Examination",
+        "https://exam.du.ac.in/exam/index.php/notifications", {"exam.du.ac.in"},
+    )
+    assert adapter._drive_file_id("https://drive.google.com/file/d/abc-123/view?x=1") == "abc-123"
+    assert adapter._drive_file_id("https://drive.google.com.evil.test/file/d/abc/view") is None
+    assert adapter._drive_file_id("https://drive.google.com/uc?id=abc") is None
+
+
 def test_http_response_read_has_an_overall_time_limit():
     class EndlessResponse:
         headers = {}
@@ -256,6 +427,90 @@ def test_http_response_rejects_oversized_content_length():
 
     with pytest.raises(SourceFetchError, match="exceeded 1000 bytes"):
         _read_bounded_response(OversizedResponse(), 1000)
+
+
+def test_http_response_reads_buffered_body_when_socket_is_already_closed():
+    class ClosedSocket:
+        def fileno(self):
+            return -1
+
+        def settimeout(self, _timeout):
+            raise AssertionError("closed sockets must not be configured")
+
+    class Raw:
+        _sock = ClosedSocket()
+
+    class BufferedFile:
+        raw = Raw()
+
+    class BufferedResponse:
+        headers = {}
+        fp = BufferedFile()
+
+        def __init__(self):
+            self.chunks = iter((b"buffered notice", b""))
+
+        def read(self, _size):
+            return next(self.chunks)
+
+    assert _read_bounded_response(BufferedResponse(), 100) == b"buffered notice"
+
+
+def test_public_site_client_returns_not_modified_only_for_conditional_fetch(monkeypatch):
+    import finalsay.adapters.live as live
+
+    class NotModifiedResponse:
+        status = 304
+        headers = {}
+        fp = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _size):
+            return b""
+
+    class Opener:
+        def open(self, request, timeout):
+            assert request.get_header("If-none-match") == '"stable-etag"'
+            assert timeout == 18
+            return NotModifiedResponse()
+
+    monkeypatch.setattr(live, "_host_is_public", lambda _host: True)
+    client = PublicSiteClient({"vtu.ac.in"})
+    client._opener = Opener()
+
+    with pytest.raises(SourceNotModified):
+        client.get(
+            "https://vtu.ac.in/files/notice.pdf",
+            1024,
+            check_robots=False,
+            request_headers={"If-None-Match": '"stable-etag"'},
+            allow_not_modified=True,
+        )
+
+
+def test_document_uses_saved_validator_and_treats_304_as_success():
+    adapter = VtuExaminationAdapter(
+        "vtu", "VTU", "https://vtu.ac.in/category/examination/", {"vtu.ac.in"}
+    )
+    url = "https://vtu.ac.in/files/notice.pdf"
+    adapter.document_validators[url] = {"etag": '"stable-etag"', "last_modified": None}
+
+    class NotModifiedClient:
+        def get(self, target, _limit, **kwargs):
+            assert target == url
+            assert kwargs["request_headers"] == {"If-None-Match": '"stable-etag"'}
+            assert kwargs["allow_not_modified"] is True
+            raise SourceNotModified(target)
+
+    adapter.client = NotModifiedClient()
+
+    assert adapter._document(url, "Exam schedule") is None
+    assert adapter.errors == []
 
 
 def test_http_stream_socket_failure_is_retried(monkeypatch):
@@ -512,6 +767,7 @@ def test_mumbai_backfill_cursor_tracks_circular_code_when_new_rows_are_added(mon
 
     first_batch = adapter.fetch()
     assert adapter.backfill_next_cursor == "mumbai-code:code-3"
+    assert adapter.errors == []  # pending historical work is progress, not a fetch failure
     assert {notice.external_id for notice in first_batch} == {
         "mumbai:code-0", "mumbai:code-1", "mumbai:code-2", "mumbai:code-3"
     }
@@ -528,7 +784,7 @@ def test_mumbai_backfill_cursor_tracks_circular_code_when_new_rows_are_added(mon
     assert adapter.backfill_next_cursor is None
 
 
-def test_mumbai_missing_stable_backfill_cursor_does_not_skip_history(monkeypatch):
+def test_mumbai_missing_stable_backfill_cursor_restarts_from_available_history(monkeypatch):
     import finalsay.adapters.live as live
 
     url = "https://mu.ac.in/circular.php"
@@ -551,10 +807,10 @@ def test_mumbai_missing_stable_backfill_cursor_does_not_skip_history(monkeypatch
 
     notices = adapter.fetch()
 
-    assert len(notices) == 1  # current row only; no guessed historical offset
-    assert adapter.backfill_complete is False
-    assert adapter.backfill_next_cursor == "mumbai-code:deleted-code"
-    assert any("no longer in the source listing" in error for error in adapter.errors)
+    assert {notice.external_id for notice in notices} == {"mumbai:code-a", "mumbai:code-b"}
+    assert adapter.backfill_complete is True
+    assert adapter.backfill_next_cursor is None
+    assert adapter.errors == []
 
 
 def test_mumbai_adapter_ocr_images_and_skips_suspicious_uploads(monkeypatch):

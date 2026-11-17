@@ -96,7 +96,7 @@ def main() -> None:
         print("Dry run only. Re-run with --apply to save these source profiles.")
     else:
         print("Saved. The running service will poll enabled sources on its next cycle.")
-        print("Default poll interval: 7200 seconds (2 hours).")
+        print("Default poll interval: 3600 seconds (1 hour).")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -24,8 +26,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from finalsay.auth import get_current_user, require_role
+from finalsay.config import get_settings
 from finalsay.db import get_db
 from finalsay.models import (
+    ApplicationSetting,
     Institution,
     Notice,
     NoticeDocumentExtraction,
@@ -33,6 +37,7 @@ from finalsay.models import (
     ReviewCase,
     ScrapeProgress,
     ScrapeRun,
+    ScrapeScheduleState,
     User,
 )
 from finalsay.schemas import (
@@ -41,16 +46,33 @@ from finalsay.schemas import (
     InstitutionCreate,
     InstitutionOut,
     InstitutionUpdate,
+    ScrapeScheduleOut,
+    ScrapeScheduleUpdate,
     ScrapeRunOut,
 )
 from finalsay.services import comparison
 from finalsay.services import ingestion
-from finalsay.services.extraction import OcrUnavailable
+from finalsay.services.extraction import InvalidDocumentError, OcrUnavailable
 
 router = APIRouter(prefix="/api/ingest", tags=["ingestion"])
+_SCRAPE_INTERVAL_SETTING = "scrape_interval_seconds"
 
 _IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
 _PDF_TYPES = {"application/pdf"}
+MAX_SUBMISSION_UPLOAD_BYTES = 20_000_000
+
+
+def _schedule_state(db: Session) -> ScrapeScheduleState:
+    state = db.get(ScrapeScheduleState, 1)
+    if state is None:
+        state = ScrapeScheduleState(
+            id=1,
+            status="idle",
+            next_scheduled_at=datetime.now(timezone.utc),
+        )
+        db.add(state)
+        db.flush()
+    return state
 
 
 # Submitting a notice for verification is a Student action in the scope note.
@@ -66,10 +88,15 @@ async def submit(
     current_user: User = Depends(require_role("student", "admin")),
 ) -> ComparisonResponse:
     """Ingest a student submission (upload or paste) and classify it."""
-    if file is None and not text:
+    if file is None and (text is None or not text.strip()):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Provide either a file (pdf/image) or pasted text.",
+        )
+    if text is not None and len(text) > 100_000:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Pasted notice text exceeds the 100,000 character limit.",
         )
 
     # Student verification always uses the college saved on the account. The
@@ -130,7 +157,15 @@ async def submit(
     image_bytes: bytes | None = None
 
     if file is not None:
-        data = await file.read()
+        # Read at most one byte beyond the cap. UploadFile is backed by a
+        # spooled temporary file, but an unbounded read would still copy an
+        # arbitrarily large upload into application memory.
+        data = await file.read(MAX_SUBMISSION_UPLOAD_BYTES + 1)
+        if len(data) > MAX_SUBMISSION_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Uploaded file exceeds the 20 MB limit.",
+            )
         content_type = (file.content_type or "").lower()
         if content_type in _PDF_TYPES or (file.filename or "").lower().endswith(".pdf"):
             pdf_bytes = data
@@ -153,6 +188,11 @@ async def submit(
             submitted_by=current_user.id,
         )
     except OcrUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except InvalidDocumentError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
@@ -289,6 +329,68 @@ def fetch(db: Session = Depends(get_db)) -> FetchResponse:
         raise
     finally:
         release_scrape_slot()
+
+
+@router.get(
+    "/schedule",
+    response_model=ScrapeScheduleOut,
+    dependencies=[Depends(require_role("admin"))],
+)
+def get_scrape_schedule(db: Session = Depends(get_db)) -> ScrapeScheduleOut:
+    """Return the persistent interval and the durable scheduler state."""
+    setting = db.get(ApplicationSetting, _SCRAPE_INTERVAL_SETTING)
+    interval = (
+        int(setting.value)
+        if setting is not None
+        else get_settings().scrape_interval_seconds
+    )
+    state = _schedule_state(db)
+    db.commit()
+    return ScrapeScheduleOut(
+        interval_seconds=interval,
+        status=state.status,
+        last_attempted_at=state.last_attempted_at,
+        last_completed_at=state.last_completed_at,
+        next_scheduled_at=state.next_scheduled_at,
+        last_error=state.last_error,
+    )
+
+
+@router.put(
+    "/schedule",
+    response_model=ScrapeScheduleOut,
+    dependencies=[Depends(require_role("admin"))],
+)
+def set_scrape_schedule(
+    payload: ScrapeScheduleUpdate,
+    db: Session = Depends(get_db),
+) -> ScrapeScheduleOut:
+    """Persist an interval and reschedule the durable poll job."""
+    setting = db.get(ApplicationSetting, _SCRAPE_INTERVAL_SETTING)
+    if setting is None:
+        setting = ApplicationSetting(
+            key=_SCRAPE_INTERVAL_SETTING,
+            value=str(payload.interval_seconds),
+        )
+        db.add(setting)
+    else:
+        setting.value = str(payload.interval_seconds)
+    state = _schedule_state(db)
+    if state.status != "running":
+        state.next_scheduled_at = datetime.now(timezone.utc) + timedelta(
+            seconds=payload.interval_seconds
+        )
+        state.status = "idle"
+    db.commit()
+    db.refresh(state)
+    return ScrapeScheduleOut(
+        interval_seconds=payload.interval_seconds,
+        status=state.status,
+        last_attempted_at=state.last_attempted_at,
+        last_completed_at=state.last_completed_at,
+        next_scheduled_at=state.next_scheduled_at,
+        last_error=state.last_error,
+    )
 
 
 @router.get("/sources", response_model=list[InstitutionOut])

@@ -8,17 +8,15 @@ import type {
   VerifyResponse,
 } from '../../api/types'
 import { loadResult, saveResult } from '../../api/resultCache'
-import LabelBadge from '../../components/LabelBadge'
 
-// The result / evidence-trail screen for a submission: shows the relationship
-// label + model score where a relationship was resolved, extracted fields,
-// the matched candidate,
-// the model rationale, and an integrity-check button.
+// Keep the first screen readable for students; evidence and machine details
+// remain available in collapsed sections for reviewers and technical users.
 export default function ResultPage() {
   const { id } = useParams<{ id: string }>()
   const submissionId = Number(id)
 
   const [submission, setSubmission] = useState<NoticeDetail | null>(null)
+  const [matchedNoticeDetail, setMatchedNoticeDetail] = useState<NoticeDetail | null>(null)
   const [candidates, setCandidates] = useState<CandidateOut[]>([])
   const [verify, setVerify] = useState<VerifyResponse | null>(null)
   const [outcome, setOutcome] = useState<ComparisonResponse | null>(null)
@@ -31,6 +29,7 @@ export default function ResultPage() {
     setError('')
     const cachedOutcome = loadResult(submissionId)
     setOutcome(cachedOutcome)
+    setMatchedNoticeDetail(null)
     try {
       const [sub, cands] = await Promise.all([
         api.get<NoticeDetail>(`/notices/${submissionId}`),
@@ -38,16 +37,26 @@ export default function ResultPage() {
       ])
       setSubmission(sub.data)
       setCandidates(cands.data)
+      let currentOutcome = cachedOutcome
       try {
         const persisted = await api.get<ComparisonResponse>(
           `/ingest/submissions/${submissionId}/result`,
         )
-        setOutcome(persisted.data)
-        saveResult(persisted.data)
+        currentOutcome = persisted.data
+        setOutcome(currentOutcome)
+        saveResult(currentOutcome)
       } catch (err) {
         // Keep the immediate local result visible when the persisted-result
         // endpoint is temporarily unavailable or an older backend is running.
         if (!cachedOutcome) setError(errorMessage(err))
+      }
+      if (currentOutcome?.candidate_id) {
+        try {
+          const official = await api.get<NoticeDetail>(`/notices/${currentOutcome.candidate_id}`)
+          setMatchedNoticeDetail(official.data)
+        } catch {
+          // Candidate title and source still render from the ranked result.
+        }
       }
     } catch (err) {
       setError(errorMessage(err))
@@ -115,179 +124,179 @@ export default function ResultPage() {
     const value = verify?.details[key]
     return typeof value === 'string' ? value : null
   }
+  const normalizedSubmissionText = (submission.redacted_text || '').replace(/\s+/g, ' ').trim()
+  const normalizedOfficialText = (matchedNoticeDetail?.redacted_text || '').replace(/\s+/g, ' ').trim()
+  const exactTextMatch = Boolean(
+    normalizedSubmissionText && normalizedOfficialText && normalizedSubmissionText === normalizedOfficialText,
+  )
+
+  const resultCopy = (() => {
+    if (listingOnlyMatch) {
+      return {
+        heading: 'Possible match; details could not be checked',
+        body: 'We matched the topic to an official university listing, but its PDF is unavailable to FinalSay. We cannot tell whether any date or other detail in your copy is wrong. This is not a finding that your notice is fake.',
+        next: 'Open the official source. If the document is unavailable, ask your college office to confirm the details.',
+      }
+    }
+    switch (outcome?.label) {
+      case 'consistent':
+        return exactTextMatch
+          ? { heading: 'Exact text match', body: 'The text in your copy is the same as the readable official notice.', next: 'Open the official source if you want to read the original.' }
+          : { heading: 'No important difference found', body: 'The comparison found this copy consistent with the readable official notice. It may not be an exact word-for-word copy.', next: 'Open the official source if you want to read the original.' }
+      case 'superseded':
+        return { heading: 'A newer notice replaces this one', body: 'The institution has published a newer version. Use the newer notice.', next: 'Open the official source and follow its latest instructions.' }
+      case 'corrected':
+        return { heading: 'The institution corrected this notice', body: 'Some details differ from the correction it published.', next: 'Open the official source and follow the corrected details.' }
+      case 'extended':
+        return { heading: 'The deadline was extended', body: 'The institution published a later deadline.', next: 'Open the official source and check the new deadline.' }
+      case 'cancelled':
+        return { heading: 'The institution cancelled this notice', body: 'A cancellation was found in the official notices.', next: 'Open the official source for any replacement instructions.' }
+      case 'contradictory':
+        return { heading: 'Some details do not match', body: 'We found a conflict with the institution’s notice.', next: 'Check the official source before acting on this copy.' }
+      default:
+        return outcome?.candidate_id
+          ? { heading: 'Needs a manual check', body: 'We found a possible match, but there is not enough evidence to confirm it. This does not mean your notice is fake.', next: 'Open the official source or ask your college office to confirm.' }
+          : { heading: 'No matching notice found yet', body: 'We could not find a close match in the notices currently available. This does not mean your notice is fake.', next: 'Check again later or ask your college office to confirm.' }
+    }
+  })()
+
+  const submittedField = (name: string) =>
+    submission.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || null
+  const officialField = (name: string, fallback?: string | null) =>
+    matchedNoticeDetail?.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || fallback?.trim() || null
+  const normalizeForCompare = (value: string) => value
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[.,;:()[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const comparedFields = [
+    { key: 'date', label: 'Notice date', submitted: submittedField('date'), official: officialField('date', matchedCandidate?.notice_date) },
+    { key: 'deadline', label: 'Deadline', submitted: submittedField('deadline'), official: officialField('deadline', matchedCandidate?.deadline) },
+    { key: 'audience', label: 'Who it applies to', submitted: submittedField('audience'), official: officialField('audience', matchedCandidate?.audience) },
+  ].filter((field) => field.submitted || field.official)
+  const hasOfficialDocumentText = Boolean(
+    (matchedNoticeDetail?.extraction_quality === 'extracted' && matchedNoticeDetail.redacted_text?.trim()) ||
+    outcome?.candidate_supplemental_extractions?.some(
+      (item) => item.extraction_quality === 'extracted' && item.extracted_text.trim(),
+    ),
+  )
 
   return (
     <div className="stack">
       <div className="card">
-        <h1>Verification result</h1>
-        <p className="muted">Submission #{submission.id}</p>
+        <h1>Notice check</h1>
+        <p className="muted result-submission-id">Submission #{submission.id}</p>
         {outcome ? (
-          <div className="stack-sm">
-            <p className="result-head">
-              <LabelBadge label={outcome.label} />
-              {outcome.label !== 'unresolved' && (
-                <span className="confidence">
-                  raw model score {outcome.confidence.toFixed(3)} (uncalibrated)
-                </span>
-              )}
-              {outcome.gated && <span className="tag">routed to review</span>}
-            </p>
-            <p>
-              <strong>Rationale:</strong> {outcome.rationale}
-            </p>
-            <p className="muted">
-              Scores are raw model rankings, not calibrated probabilities. Results marked
-              unresolved are routed to review; other labels are applied only above the
-              configured threshold.
-            </p>
-            {outcome.evidence && outcome.evidence.length > 0 && (
-              <div>
-                <strong>Comparison evidence</strong>
-                <ul>{outcome.evidence.map((item, index) => <li key={index}>{item}</li>)}</ul>
-              </div>
+          <div className="stack-sm result-summary">
+            <h2>{resultCopy.heading}</h2>
+            <p>{resultCopy.body}</p>
+          </div>
+        ) : (
+          <p className="muted">A comparison result is not available for this submission yet.</p>
+        )}
+        {matchedCandidate && (
+          <section className="result-match">
+            <p className="eyebrow">OFFICIAL NOTICE MATCH</p>
+            <h2>{matchedCandidate.title || `Official notice #${matchedCandidate.id}`}</h2>
+            <p className="muted">{outcome?.candidate_institution || 'Your selected institution'} · Notice #{matchedCandidate.id}</p>
+            {outcome?.candidate_source_url && (
+              <p><a href={outcome.candidate_source_url} target="_blank" rel="noreferrer">Open official source ↗</a></p>
             )}
-            <p className="muted">
-              Model: {outcome.model || 'mock'} · edge status: {outcome.status}
-            </p>
-          </div>
-        ) : (
-          <p className="muted">
-            The relationship label is shown right after submitting. Re-submit from{' '}
-            <Link to="/submit">Submit</Link> to see it again.
-          </p>
+          </section>
         )}
-        {outcome?.candidate_id || topCandidate ? (
-          <p>
-            Matched against official notice <strong>#{outcome?.candidate_id ?? topCandidate?.notice.id}</strong>{' '}
-            {outcome?.candidate_score != null && `(combined retrieval rank ${outcome.candidate_score.toFixed(3)})`}
-          </p>
-        ) : (
-          <p className="muted">No candidate official notice was found for this submission.</p>
+        {matchedCandidate && (
+          <section className="result-differences">
+            <h3>What differs from your copy?</h3>
+            {listingOnlyMatch ? (
+              <>
+                <p>FinalSay recognized the topic, but couldn’t read the official PDF. So it couldn’t verify whether dates or other details in your copy were changed.</p>
+                <div className="result-fact-list">
+                  <div><strong>Date detected in your copy</strong><span>{submittedField('date') || 'Not detected'}</span></div>
+                  <div><strong>Official portal listing date</strong><span>{matchedCandidate.published_date || 'Not shown'}</span></div>
+                  <div><strong>What that means</strong><span>The listing date is when the notice was posted; it does not confirm the dates printed in the PDF.</span></div>
+                </div>
+              </>
+            ) : comparedFields.length > 0 ? (
+              <>
+                <p className="muted">These are the fields FinalSay could extract. “Different” means the extracted values differ; OCR can make mistakes.</p>
+                <div className="table-scroll">
+                  <table>
+                    <thead><tr><th>Detail</th><th>Your copy</th><th>Official notice</th><th>Check</th></tr></thead>
+                    <tbody>{comparedFields.map((field) => {
+                      const same = field.submitted && field.official && normalizeForCompare(field.submitted) === normalizeForCompare(field.official)
+                      const different = field.submitted && field.official && !same
+                      return <tr key={field.key}>
+                        <th>{field.label}</th>
+                        <td>{field.submitted || 'Not found in your copy'}</td>
+                        <td>{field.official || 'Not available in official record'}</td>
+                        <td>{same ? 'Same' : different ? 'Different' : 'Cannot compare'}</td>
+                      </tr>
+                    })}</tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <p>{hasOfficialDocumentText
+                ? 'FinalSay compared the notice text and found no date or deadline fields it could reliably display side by side.'
+                : 'The official record does not contain enough readable detail to show which part of your copy differs.'}</p>
+            )}
+          </section>
         )}
-        {listingOnlyMatch && (
-          <div className="banner" role="status">
-            <strong>Official document text is unavailable for this match.</strong>
-            <p>
-              FinalSay found a related portal listing, but could not verify its PDF or
-              attachment. Any relationship that depends on changed dates is sent for
-              review instead of being presented as confirmed.
-            </p>
-          </div>
-        )}
+        <section className="result-next">
+          <h3>Next step</h3>
+          <p>{resultCopy.next}</p>
+          {!matchedCandidate && <p><Link to="/notices">Browse official notices</Link></p>}
+        </section>
       </div>
 
-      <div className="card">
-        <h2>Extracted fields (evidence)</h2>
-        {submission.fields.length === 0 ? (
-          <p className="muted">No fields extracted.</p>
-        ) : (
+      <details className="card result-details">
+        <summary>Why did I get this result?</summary>
+        <p>{outcome?.rationale || 'No comparison explanation is available.'}</p>
+        {outcome?.gated && <p className="muted">This result was sent for a closer review. It is not a finding that your notice is fake.</p>}
+        {outcome?.evidence && outcome.evidence.length > 0 && <ul>{outcome.evidence.map((item, index) => <li key={index}>{item}</li>)}</ul>}
+        {outcome?.confidence != null && <p className="muted">Technical model score: {outcome.confidence.toFixed(3)} (not a probability).</p>}
+        <p className="muted">Comparison model: {outcome?.model || 'not available'}</p>
+      </details>
+
+      <details className="card result-details">
+        <summary>View extracted text and fields</summary>
+        {submission.fields.length > 0 && (
           <table>
-            <thead>
-              <tr>
-                <th>Field</th>
-                <th>Value</th>
-                <th>Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              {submission.fields.map((f) => (
-                <tr key={f.field_name}>
-                  <td>{f.field_name}</td>
-                  <td>{f.value ?? <span className="muted">—</span>}</td>
-                  <td>{f.confidence != null ? f.confidence.toFixed(2) : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
+            <thead><tr><th>Field</th><th>Value</th><th>Confidence</th></tr></thead>
+            <tbody>{submission.fields.map((field) => (
+              <tr key={field.field_name}><td>{field.field_name}</td><td>{field.value ?? '—'}</td><td>{field.confidence != null ? field.confidence.toFixed(2) : '—'}</td></tr>
+            ))}</tbody>
           </table>
         )}
-        {submission.redacted_text && (
-          <>
-            <h3>Redacted text</h3>
-            <pre className="pre">{submission.redacted_text}</pre>
-          </>
-        )}
-      </div>
+        {submission.redacted_text && <><h3>Your notice text (redacted)</h3><pre className="pre">{submission.redacted_text}</pre></>}
+        {outcome?.candidate_text && <><h3>Official listing text</h3><pre className="pre">{outcome.candidate_text}</pre></>}
+        {outcome?.candidate_supplemental_extractions?.map((extraction) => (
+          <section key={`${extraction.source_url}-${extraction.extracted_text_sha256}`}>
+            <h3>Text extracted from the official document</h3>
+            <p className="muted">{extraction.extraction_quality} · {extraction.extraction_method}</p>
+            <pre className="pre">{extraction.extracted_text}</pre>
+          </section>
+        ))}
+      </details>
 
-      {(outcome?.candidate_id || topCandidate) && (
-        <div className="card">
-          <h2>Closest official notice</h2>
-          <dl className="kv">
-            <dt>Notice</dt>
-            <dd>#{outcome?.candidate_id ?? topCandidate?.notice.id}</dd>
-            <dt>Institution</dt>
-            <dd>{outcome?.candidate_institution ?? '—'}</dd>
-            <dt>Issuer</dt>
-            <dd>{outcome?.candidate_issuer ?? topCandidate?.notice.issuer ?? '—'}</dd>
-            <dt>Date</dt>
-            <dd>{outcome?.candidate_notice_date ?? topCandidate?.notice.notice_date ?? '—'}</dd>
-            <dt>Deadline</dt>
-            <dd>{outcome?.candidate_deadline ?? topCandidate?.notice.deadline ?? '—'}</dd>
-            <dt>Audience</dt>
-            <dd>{topCandidate?.notice.audience ?? '—'}</dd>
-            <dt>Source</dt>
-            <dd>{outcome?.candidate_source_url ? <a href={outcome.candidate_source_url} target="_blank" rel="noreferrer">{outcome.candidate_source_url}</a> : '—'}</dd>
-            <dt>Retrieved</dt>
-            <dd>{topCandidate?.notice.retrieved_at ? new Date(topCandidate.notice.retrieved_at).toLocaleString() : '—'}</dd>
-            <dt>Content hash</dt>
-            <dd className="mono">{topCandidate?.notice.sha256 ?? '—'}</dd>
-          </dl>
-          {outcome?.candidate_text && <><h3>Official notice text</h3><pre className="pre">{outcome.candidate_text}</pre></>}
-          {outcome?.candidate_supplemental_extractions?.map((extraction) => (
-            <section key={`${extraction.source_url}-${extraction.extracted_text_sha256}`}>
-              <h3>Additional text extracted from the linked document</h3>
-              <p className="muted">{extraction.extraction_quality} · {extraction.extraction_method} · <a href={extraction.source_url} target="_blank" rel="noreferrer">Source document</a></p>
-              <pre className="pre">{extraction.extracted_text}</pre>
-            </section>
-          ))}
-          <Link to={`/notices`}>Browse all official notices</Link>
-        </div>
-      )}
-
-      <div className="card">
-        <h2>Official notice integrity</h2>
-        <p className="muted">
-          Verify the matched official notice’s SHA-256 hash and Merkle proof against its recorded anchor.
-        </p>
+      <details className="card result-details">
+        <summary>Technical integrity check</summary>
+        <p className="muted">Check the stored hash and Merkle proof for the matched official notice.</p>
         <div className="row">
           <button disabled={verifying || (!outcome?.candidate_id && !topCandidate)} onClick={() => runVerify(false)}>
-            Verify official notice
-          </button>
-          <button
-            className="btn-secondary"
-            disabled={verifying || (!outcome?.candidate_id && !topCandidate)}
-            onClick={() => runVerify(true)}
-          >
-            Simulate tamper
+            {verifying ? 'Checking…' : 'Check notice integrity'}
           </button>
         </div>
         {verify && (
           <div className={`banner ${verify.integrity_status === 'TAMPERED' ? 'banner-bad' : verify.integrity_status === 'VERIFIED' || verify.integrity_status === 'LOCAL_VERIFIED' ? 'banner-ok' : ''}`}>
             <strong>{integrityMessage(verify.integrity_status)}</strong>
-            <dl className="kv">
-              <dt>Notice</dt><dd>#{outcome?.candidate_id ?? topCandidate?.notice.id}</dd>
-              <dt>Integrity status</dt><dd>{verify.integrity_status}</dd>
-              <dt>Hash check</dt><dd>{verify.details.integrity_ok === true ? 'Passed' : 'Failed'}</dd>
-              <dt>Merkle proof</dt><dd>{verify.details.recomputed_root === verify.details.stored_root ? 'Passed' : 'Failed'}</dd>
-              <dt>Network</dt><dd>{detailText('anchor_network') ?? (detailText('anchor_kind') === 'local' ? 'Local hash chain' : '—')}</dd>
-              <dt>Publisher</dt><dd className="mono">{detailText('anchor_issuer_address') ?? '—'}</dd>
-              <dt>Issuer-set hash</dt><dd className="mono">{detailText('anchor_issuer_id') ?? '—'}</dd>
-              <dt>Transaction status</dt><dd>{detailText('transaction_status') ?? detailText('anchor_status') ?? '—'}</dd>
-              <dt>Transaction hash</dt><dd className="mono">{detailText('transaction_hash') ?? '—'}</dd>
-              <dt>Contract</dt><dd className="mono">{detailText('anchor_contract_address') ?? '—'}</dd>
-              <dt>Block</dt><dd>{detailText('anchor_block_number') ?? '—'}</dd>
-              <dt>Timestamp</dt><dd>{detailText('anchor_timestamp') ? new Date(detailText('anchor_timestamp')!).toLocaleString() : '—'}</dd>
-            </dl>
-            {detailText('explorer_transaction_url') && (
-              <p><a href={detailText('explorer_transaction_url')!} target="_blank" rel="noreferrer">Open transaction on Polygon Amoy</a></p>
-            )}
-            {detailText('explorer_contract_url') && (
-              <p><a href={detailText('explorer_contract_url')!} target="_blank" rel="noreferrer">Open contract on Polygon Amoy</a></p>
-            )}
+            <p>{verify.integrity_status}</p>
             {detailText('anchor_error') && <p>{detailText('anchor_error')}</p>}
-            <pre className="pre">{JSON.stringify(verify.details, null, 2)}</pre>
+            <details><summary>Advanced verification data</summary><pre className="pre">{JSON.stringify(verify.details, null, 2)}</pre></details>
           </div>
         )}
-      </div>
+      </details>
 
       {error && <p className="error">{error}</p>}
     </div>

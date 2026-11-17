@@ -14,7 +14,7 @@ def _production_settings(**overrides) -> Settings:
         "jwt_secret": "r" * 48,
         "cors_origins": "https://finalsay.example.edu",
         "comparison_model": "semantic",
-        "scrape_interval_seconds": 7200,
+        "scrape_interval_seconds": 3600,
     }
     values.update(overrides)
     return Settings(**values)

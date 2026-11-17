@@ -36,6 +36,16 @@ def test_submission_title_parses_curly_quoted_wrapped_ocr_subject():
     )
 
 
+def test_submission_title_parses_du_course_result_heading_without_subject():
+    text = (
+        "S.NO.AER/2026/676\n\n"
+        "UNIVERSITY OF DELHI\n\n"
+        "CERTIFICATE COURSE IN TIBETAN LANGUAGE EXAMINATION, 2026\n\n"
+        "The following Candidates are declared to have Passed the Examination"
+    )
+    assert ingestion._extract_title(text) == "CERTIFICATE COURSE IN TIBETAN LANGUAGE"
+
+
 def test_persisted_result_endpoint_returns_latest_reviewed_comparison(client, db_session):
     institution = Institution(
         name="Result University", slug="persisted-result-test", active=True
@@ -229,6 +239,159 @@ def test_fetch_all_can_target_one_configured_source(db_session, monkeypatch):
     assert [item["slug"] for item in summary["institutions"]] == ["target-source"]
 
 
+def test_complete_source_snapshot_marks_missing_rows_removed(db_session, monkeypatch):
+    import finalsay.adapters.live as live
+
+    institution = Institution(
+        name="Snapshot University", slug="snapshot-university",
+        source_url="https://vtu.ac.in/category/examination/",
+        scrape_type="vtu_examination", active=True, scrape_enabled=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    present_key = "vtu:present"
+    removed_key = "vtu:removed"
+    present_url = "https://vtu.ac.in/notices/present.pdf"
+    removed_url = "https://vtu.ac.in/notices/removed.pdf"
+    present, _ = ingestion.upsert_official(
+        db_session,
+        RawNotice(
+            text="Issued by: Snapshot University\nSubject: Current exam timetable\nThe exam timetable is available.",
+            source_url=present_url, institution_slug=institution.slug,
+            external_id=present_key, metadata={"title": "Current exam timetable"},
+        ),
+        institution,
+    )
+    removed, _ = ingestion.upsert_official(
+        db_session,
+        RawNotice(
+            text="Issued by: Snapshot University\nSubject: Old exam timetable\nThe old timetable is available.",
+            source_url=removed_url, institution_slug=institution.slug,
+            external_id=removed_key, metadata={"title": "Old exam timetable"},
+        ),
+        institution,
+    )
+    manually_published = ingestion.publish_official(
+        db_session,
+        text="Issued by: Snapshot University\nSubject: Manual campus update\nThis is an issuer-uploaded notice.",
+        institution=institution,
+        source_url="https://vtu.ac.in/issuer/manual-campus-update.pdf",
+    )
+    db_session.flush()
+
+    class SnapshotAdapter:
+        errors = []
+        supports_backfill = False
+        source_snapshot_complete = True
+        source_snapshot_keys = {present_key}
+
+        def __init__(self, source):
+            self.slug = source.slug
+            self.name = source.name
+            self.base_url = source.source_url
+
+        def fetch(self):
+            return [RawNotice(
+                text="Issued by: Snapshot University\nSubject: Current exam timetable\nThe exam timetable is available.",
+                source_url=present_url, institution_slug=institution.slug,
+                external_id=present_key, metadata={"title": "Current exam timetable"},
+            )]
+
+    monkeypatch.setattr(live, "create_live_adapter", SnapshotAdapter)
+    summary = ingestion.fetch_all(db_session)
+
+    assert summary["removed"] == 1
+    assert present.source_state == "active"
+    assert present.source_removed_at is None
+    assert removed.source_state == "removed"
+    assert removed.source_removed_at is not None
+    assert manually_published.source_state == "active"
+    assert manually_published.source_removed_at is None
+
+
+def test_incomplete_source_snapshot_never_marks_rows_removed(db_session, monkeypatch):
+    import finalsay.adapters.live as live
+
+    institution = Institution(
+        name="Partial Snapshot University", slug="partial-snapshot-university",
+        source_url="https://vtu.ac.in/category/examination/",
+        scrape_type="vtu_examination", active=True, scrape_enabled=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    notice, _ = ingestion.upsert_official(
+        db_session,
+        RawNotice(
+            text="Issued by: Partial Snapshot University\nSubject: Timetable\nThe timetable is current.",
+            source_url="https://vtu.ac.in/notices/timetable.pdf",
+            institution_slug=institution.slug, external_id="vtu:still-present",
+            metadata={"title": "Timetable"},
+        ),
+        institution,
+    )
+
+    class IncompleteAdapter:
+        errors = ["catalog page temporarily unavailable"]
+        supports_backfill = False
+        source_snapshot_complete = False
+        source_snapshot_keys = set()
+
+        def __init__(self, source):
+            self.slug = source.slug
+            self.name = source.name
+            self.base_url = source.source_url
+
+        def fetch(self):
+            return []
+
+    monkeypatch.setattr(live, "create_live_adapter", IncompleteAdapter)
+    summary = ingestion.fetch_all(db_session)
+
+    assert summary["removed"] == 0
+    assert notice.source_state == "active"
+    assert notice.source_removed_at is None
+
+
+def test_admin_notice_review_api_is_admin_only_and_filters_student_feed(client, make_user, db_session):
+    institution = Institution(name="Review University", slug="review-university", active=True)
+    db_session.add(institution)
+    db_session.flush()
+    notice = Notice(
+        kind="official",
+        institution_id=institution.id,
+        title="Examination timetable",
+        redacted_text="Subject: Examination timetable",
+        source_url="https://vtu.ac.in/notices/timetable.pdf",
+    )
+    db_session.add(notice)
+    db_session.commit()
+    admin_token = _token(client, make_user, "notice-admin@example.com", "secret123", "admin")
+    student_token = _token(client, make_user, "notice-student@example.com", "secret123", "student")
+
+    listed = client.get("/api/admin/notices", headers=_auth(admin_token))
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["redacted_text"] == "Subject: Examination timetable"
+    assert client.get("/api/admin/notices", headers=_auth(student_token)).status_code == 403
+
+    flagged = client.patch(
+        f"/api/admin/notices/{notice.id}/review",
+        headers=_auth(admin_token),
+        json={"status": "flagged", "note": "Check extracted publication date."},
+    )
+    assert flagged.status_code == 200
+    assert flagged.json()["admin_status"] == "flagged"
+    assert flagged.json()["admin_review_note"] == "Check extracted publication date."
+
+    # The public student feed never offers a notice that an admin has flagged.
+    student = db_session.query(User).filter(User.email == "notice-student@example.com").one()
+    student.institution_id = institution.id
+    db_session.commit()
+    feed = client.get("/api/notices", headers=_auth(student_token))
+    assert feed.status_code == 200
+    assert all(item["id"] != notice.id for item in feed.json())
+
+
 def test_ingested_source_date_is_stored_separately_and_notice_is_candidate_retrievable(db_session):
     institution = ingestion.get_or_create_institution(
         db_session, "scraped-test", "Scraped Test University", "https://www.thapar.edu"
@@ -314,18 +477,32 @@ def test_live_source_backfill_cursor_persists_and_advances_after_success(db_sess
         supports_backfill = True
         backfill_complete = False
         backfill_next_cursor = None
+        source_snapshot_cursor = None
 
         def __init__(self, next_cursor, complete):
             self.backfill_next_cursor = next_cursor
             self.complete_after_fetch = complete
+            self.source_snapshot_cursor = (
+                "https://www.thapar.edu/notices/snapshot/next"
+                if not complete else None
+            )
 
         def fetch(self):
             self.backfill_complete = self.complete_after_fetch
+            self.source_snapshot_complete = self.complete_after_fetch
+            self.source_snapshot_keys = {
+                "https://www.thapar.edu/notices/exam.pdf"
+            }
             return [RawNotice(
                 text="Issued by: Cursor University\nSubject: Official exam timetable\nExam timetable revised for winter.",
                 source_url="https://www.thapar.edu/notices/exam.pdf",
                 institution_slug="cursor-university",
                 external_id="https://www.thapar.edu/notices/exam.pdf",
+                metadata={
+                    "attachment_url": "https://www.thapar.edu/notices/exam.pdf",
+                    "source_etag": '"v1"',
+                    "source_last_modified": "Mon, 16 Nov 2026 10:00:00 GMT",
+                },
             )]
 
     def fake_create(_institution):
@@ -339,10 +516,19 @@ def test_live_source_backfill_cursor_persists_and_advances_after_success(db_sess
     progress = db_session.get(ScrapeProgress, institution.id)
     assert progress.cursor == "https://www.thapar.edu/notices/page/3"
     assert progress.backfill_complete is False
+    assert progress.snapshot_cursor == "https://www.thapar.edu/notices/snapshot/next"
+    assert "exam.pdf" in progress.snapshot_keys_json
+    notice = db_session.query(Notice).filter(Notice.kind == "official").one()
+    assert notice.source_document_url == "https://www.thapar.edu/notices/exam.pdf"
+    assert notice.source_etag == '"v1"'
+    assert notice.source_last_modified == "Mon, 16 Nov 2026 10:00:00 GMT"
 
     ingestion.fetch_all(db_session, include_fixtures=False)
     assert progress.cursor is None
     assert progress.backfill_complete is True
+    assert progress.snapshot_cursor is None
+    assert progress.snapshot_keys_json == "[]"
+    assert progress.snapshot_completed_at is not None
 
 
 def test_scheduled_source_batches_commit_independently(db_session, monkeypatch):
@@ -532,6 +718,181 @@ def test_submit_without_input_is_422(client: TestClient, make_user):
     assert resp.status_code == 422
 
 
+def test_submit_rejects_whitespace_only_text(client: TestClient, make_user):
+    student = _token(client, make_user, "empty-text@example.com", "s3cret1", "student")
+    resp = client.post(
+        "/api/ingest/submit", data={"text": " \n  "}, headers=_auth(student)
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Provide either a file (pdf/image) or pasted text."
+
+
+def test_submit_rejects_overlong_pasted_text(client: TestClient, make_user):
+    student = _token(client, make_user, "long-text@example.com", "s3cret1", "student")
+    response = client.post(
+        "/api/ingest/submit",
+        data={"text": "x" * 100_001},
+        headers=_auth(student),
+    )
+    assert response.status_code == 413
+    assert "100,000 character limit" in response.json()["detail"]
+
+
+def test_submit_rejects_upload_over_size_limit_without_persisting(
+    client: TestClient, make_user, db_session, monkeypatch
+):
+    import finalsay.api.ingestion as ingestion_api
+
+    institution = Institution(
+        name="Upload Limit University", slug="upload-limit-university",
+        scrape_type="vtu_examination", active=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    db_session.add(Notice(
+        kind="official", institution_id=institution.id,
+        title="Reference", redacted_text="Reference notice text.",
+    ))
+    db_session.commit()
+    student = _token(client, make_user, "upload-limit@example.com", "s3cret1", "student")
+    client.patch(
+        "/api/auth/me/institution", json={"institution_id": institution.id},
+        headers=_auth(student),
+    )
+    monkeypatch.setattr(ingestion_api, "MAX_SUBMISSION_UPLOAD_BYTES", 8)
+
+    response = client.post(
+        "/api/ingest/submit",
+        files={"file": ("oversized.pdf", b"x" * 9, "application/pdf")},
+        headers=_auth(student),
+    )
+
+    assert response.status_code == 413
+    assert "20 MB limit" in response.json()["detail"]
+    assert db_session.query(Notice).filter(Notice.kind == "submission").count() == 0
+
+
+def test_submit_reports_empty_and_corrupt_pdfs_as_client_errors(
+    client: TestClient, make_user, db_session
+):
+    institution = Institution(
+        name="PDF Error University", slug="pdf-error-university",
+        scrape_type="thapar_html", active=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    db_session.add(Notice(
+        kind="official", institution_id=institution.id,
+        title="Reference", redacted_text="Reference notice text.",
+    ))
+    db_session.commit()
+    student = _token(client, make_user, "pdf-errors@example.com", "s3cret1", "student")
+    client.patch(
+        "/api/auth/me/institution", json={"institution_id": institution.id},
+        headers=_auth(student),
+    )
+
+    for payload in (b"", b"not a PDF"):
+        response = client.post(
+            "/api/ingest/submit",
+            files={"file": ("notice.pdf", payload, "application/pdf")},
+            headers=_auth(student),
+        )
+        assert response.status_code == 422, response.text
+        assert "PDF" in response.json()["detail"]
+
+    assert db_session.query(Notice).filter(Notice.kind == "submission").count() == 0
+
+
+def test_submit_rejects_unsupported_upload_format(client: TestClient, make_user, db_session):
+    institution = Institution(
+        name="Unsupported File University", slug="unsupported-file-university",
+        scrape_type="thapar_html", active=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    db_session.add(Notice(
+        kind="official", institution_id=institution.id,
+        title="Reference", redacted_text="Reference notice text.",
+    ))
+    db_session.commit()
+    student = _token(client, make_user, "unsupported-file@example.com", "s3cret1", "student")
+    client.patch(
+        "/api/auth/me/institution", json={"institution_id": institution.id},
+        headers=_auth(student),
+    )
+
+    response = client.post(
+        "/api/ingest/submit",
+        files={"file": ("notice.docx", b"not a supported document", "application/octet-stream")},
+        headers=_auth(student),
+    )
+
+    assert response.status_code == 415
+    assert db_session.query(Notice).filter(Notice.kind == "submission").count() == 0
+
+
+def test_real_thapar_pdf_upload_is_compared_and_persisted(
+    client: TestClient, make_user, db_session
+):
+    from pathlib import Path
+
+    from finalsay.services import extraction
+
+    pdf_path = Path(__file__).parent / "fixtures" / "thapar-hostel-retention.pdf"
+    pdf_bytes = pdf_path.read_bytes()
+    official_text = extraction.text_from_pdf(pdf_bytes)
+    institution = Institution(
+        name="Thapar Institute of Engineering and Technology",
+        slug="real-thapar-pdf-test", scrape_type="thapar_html", active=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    official = Notice(
+        kind="official", institution_id=institution.id,
+        title="Hostel Retention Notice (EVEN Sem 2026-27)",
+        redacted_text=extraction.redact(official_text),
+        source_url=(
+            "https://www.thapar.edu/upload/files/"
+            "TIET-Hostel%20Retention%20Notice%20%28EVEN%202026-27%29.pdf"
+        ),
+        extraction_quality="extracted",
+    )
+    db_session.add(official)
+    db_session.commit()
+    student = _token(client, make_user, "real-thapar-upload@example.com", "s3cret1", "student")
+    client.patch(
+        "/api/auth/me/institution", json={"institution_id": institution.id},
+        headers=_auth(student),
+    )
+
+    response = client.post(
+        "/api/ingest/submit",
+        files={"file": (pdf_path.name, pdf_bytes, "application/pdf")},
+        headers=_auth(student),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["candidate_id"] == official.id
+    assert body["candidate_source_url"] == official.source_url
+    assert body["label"] in {
+        "consistent", "contradictory", "superseded", "unresolved",
+        "corrected", "extended", "cancelled",
+    }
+    db_session.expire_all()
+    saved = db_session.get(Notice, body["submission_id"])
+    assert saved is not None
+    assert saved.submitted_by == make_user(
+        "real-thapar-upload@example.com", "s3cret1", "student"
+    ).id
+    assert saved.institution_id == institution.id
+    assert len(saved.redacted_text or "") > 500
+    assert db_session.scalar(
+        select(RelationEdge).where(RelationEdge.src_notice_id == saved.id)
+    ) is not None
+
+
 def test_submit_image_without_ocr_engine_is_422(client: TestClient, make_user, monkeypatch, db_session):
     """With no Tesseract engine, image upload degrades to 422 asking for text."""
     from finalsay.services import extraction
@@ -608,6 +969,37 @@ def test_sources_crud(client: TestClient, make_user):
     listing = client.get("/api/ingest/sources", headers=_auth(admin))
     assert listing.status_code == 200
     assert any(i["slug"] == "test-uni" for i in listing.json())
+
+
+def test_admin_can_persist_poll_interval_and_public_roles_cannot_change_it(client, make_user):
+    admin = _token(client, make_user, "poll-schedule-admin@example.com", "s3cret1", "admin")
+    student = _token(client, make_user, "poll-schedule-student@example.com", "s3cret1", "student")
+
+    initial = client.get("/api/ingest/schedule", headers=_auth(admin))
+    assert initial.status_code == 200
+    # API tests disable the background thread through the environment.
+    assert initial.json()["interval_seconds"] == 0
+
+    saved = client.put(
+        "/api/ingest/schedule",
+        json={"interval_seconds": 1_800},
+        headers=_auth(admin),
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["interval_seconds"] == 1_800
+    assert client.get("/api/ingest/schedule", headers=_auth(admin)).json() == saved.json()
+
+    invalid = client.put(
+        "/api/ingest/schedule",
+        json={"interval_seconds": 1_200},
+        headers=_auth(admin),
+    )
+    assert invalid.status_code == 422
+    assert client.put(
+        "/api/ingest/schedule",
+        json={"interval_seconds": 7_200},
+        headers=_auth(student),
+    ).status_code == 403
 
 
 def test_admin_can_onboard_selected_official_portals(client: TestClient, make_user):

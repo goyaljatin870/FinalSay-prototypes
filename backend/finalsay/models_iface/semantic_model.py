@@ -11,6 +11,7 @@ import re
 import hashlib
 import threading
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -99,10 +100,29 @@ def _date_values(text: str) -> set[tuple[int, int, int | None]]:
 @lru_cache(maxsize=1)
 def _load_models(embedding_model: str, nli_model: str):
     try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
         from sentence_transformers import CrossEncoder, SentenceTransformer
 
-        embedding = SentenceTransformer(embedding_model, device="cpu")
-        nli = CrossEncoder(nli_model, device="cpu", max_length=512)
+        def resolve_cached_source(model_name: str) -> str:
+            # Prefer an already cached, immutable snapshot. Passing the repo
+            # name directly makes Hugging Face perform online metadata checks
+            # even when all weights are present, which breaks offline/local
+            # development when DNS is unavailable. If no snapshot is cached,
+            # retain the normal first-run download behavior.
+            if Path(model_name).expanduser().is_dir():
+                return str(Path(model_name).expanduser())
+            try:
+                return snapshot_download(repo_id=model_name, local_files_only=True)
+            except LocalEntryNotFoundError:
+                return model_name
+
+        embedding = SentenceTransformer(
+            resolve_cached_source(embedding_model), device="cpu"
+        )
+        nli = CrossEncoder(
+            resolve_cached_source(nli_model), device="cpu", max_length=512
+        )
         return embedding, nli
     except Exception as exc:  # noqa: BLE001 - report cleanly through the API
         raise SemanticModelUnavailable(

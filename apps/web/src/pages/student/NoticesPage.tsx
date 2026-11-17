@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import { useAuth } from '../../auth/AuthContext'
 import { api, errorMessage } from '../../api/client'
 import type { NoticeDetail, StudentNoticeFeed, StudentNoticeItem } from '../../api/types'
 
@@ -22,6 +23,8 @@ function formatPublishedDate(notice: StudentNoticeItem): string {
 }
 
 export default function NoticesPage() {
+  const { user } = useAuth()
+  const institutionId = user?.institution_id ?? null
   const [searchParams, setSearchParams] = useSearchParams()
   const month = searchParams.get('month') ?? ''
   const query = searchParams.get('q') ?? ''
@@ -37,8 +40,10 @@ export default function NoticesPage() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    let current = true
     setLoading(true)
     setError('')
+    setSelected(null)
     api
       .get<StudentNoticeFeed>('/notices/student/feed', {
         params: {
@@ -48,10 +53,19 @@ export default function NoticesPage() {
           page_size: PAGE_SIZE,
         },
       })
-      .then((res) => setFeed(res.data))
-      .catch((err) => setError(errorMessage(err)))
-      .finally(() => setLoading(false))
-  }, [month, query, page])
+      .then((res) => {
+        if (current) setFeed(res.data)
+      })
+      .catch((err) => {
+        if (current) setError(errorMessage(err))
+      })
+      .finally(() => {
+        if (current) setLoading(false)
+      })
+    return () => {
+      current = false
+    }
+  }, [institutionId, month, query, page])
 
   useEffect(() => setSearchInput(query), [query])
 

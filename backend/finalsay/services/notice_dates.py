@@ -26,6 +26,7 @@ _FORMATS = (
 )
 _DATE_TIME_SUFFIX = re.compile(r"\s+(?:\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]M)?|\d{1,2}\s+[AP]M)$", re.I)
 _LABEL_PREFIX = re.compile(r"^(?:published(?:\s+date)?|publication\s+date|date|dated)\s*[:\-]\s*", re.I)
+_ORDINAL_DAY = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.I)
 
 
 def parse_publication_date(value: str | date | datetime | None) -> date | None:
@@ -40,6 +41,7 @@ def parse_publication_date(value: str | date | datetime | None) -> date | None:
     candidate = " ".join(str(value).strip().split())
     candidate = _LABEL_PREFIX.sub("", candidate).strip().rstrip(".,")
     candidate = _DATE_TIME_SUFFIX.sub("", candidate).strip().rstrip(".,")
+    candidate = _ORDINAL_DAY.sub(r"\1", candidate)
     if not candidate:
         return None
 

@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from finalsay.api import auth as auth_api
+from finalsay.api import admin_notices as admin_notices_api
 from finalsay.api import benchmark_admin as benchmark_admin_api
 from finalsay.api import comparison as comparison_api
 from finalsay.api import ingestion as ingestion_api
@@ -103,6 +104,7 @@ def create_app() -> FastAPI:
         return HealthResponse(status="ok")
 
     app.include_router(auth_api.router)
+    app.include_router(admin_notices_api.router)
     app.include_router(benchmark_admin_api.router)
     app.include_router(provenance_api.router)
     app.include_router(comparison_api.router)

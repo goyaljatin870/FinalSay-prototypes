@@ -30,8 +30,8 @@ def refresh_unknown_document_extractions(
 
     Re-extracted text is stored as a separately hashed sidecar. It never
     mutates ``Notice.redacted_text``, ``Notice.sha256`` or version history.
-    External-host links (including Delhi's Google Drive files) are skipped
-    before any request is made.
+    External-host links are skipped except canonical Delhi Drive file links,
+    which use the configured read-only Google Drive API path.
     """
     if per_institution < 1:
         raise ValueError("per_institution must be at least 1")
@@ -101,7 +101,10 @@ def refresh_unknown_document_extractions(
             if notice.id in existing_ids:
                 continue
             source_url = notice.source_url or ""
-            if urlsplit(source_url).hostname not in adapter.allowed_hosts:
+            is_drive_file = bool(
+                getattr(adapter, "_drive_file_id", lambda _url: None)(source_url)
+            )
+            if urlsplit(source_url).hostname not in adapter.allowed_hosts and not is_drive_file:
                 skipped_external += 1
                 continue
             if attempted >= per_institution:
@@ -109,6 +112,7 @@ def refresh_unknown_document_extractions(
             attempted += 1
 
             try:
+                prior_error_count = len(getattr(adapter, "errors", []))
                 if institution.scrape_type == "vtu_examination":
                     raw = adapter.fetch_post(
                         source_url, notice.title or "", listing_text=""
@@ -116,17 +120,29 @@ def refresh_unknown_document_extractions(
                     if notice.published_date:
                         raw.metadata["source_date"] = notice.published_date
                 else:
-                    raw = adapter._document(
-                        source_url,
-                        notice.title or "Official notice",
-                        date=notice.published_date,
-                        external_id=notice.source_key,
-                    )
+                    if is_drive_file:
+                        raw = adapter._drive_pdf(
+                            source_url,
+                            notice.title or "Official notice",
+                            date=notice.published_date,
+                        )
+                    else:
+                        raw = adapter._document(
+                            source_url,
+                            notice.title or "Official notice",
+                            date=notice.published_date,
+                            external_id=notice.source_key,
+                        )
                 if (
                     raw is None
                     or raw.metadata.get("extraction_quality") != "extracted"
                     or not raw.text.strip()
                 ):
+                    new_adapter_errors = getattr(adapter, "errors", [])[prior_error_count:]
+                    if new_adapter_errors:
+                        error = f"notice {notice.id}: {str(new_adapter_errors[-1])[:180]}"
+                        institution_errors.append(error)
+                        summary["errors"].append(f"{institution.slug}: {error}")
                     skipped_unextractable += 1
                     continue
 

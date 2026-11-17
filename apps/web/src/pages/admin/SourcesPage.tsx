@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, errorMessage } from '../../api/client'
-import type { BenchmarkCandidateOut, FetchResponse, InstitutionOut, IssuerMembershipOut, ScrapeRunOut } from '../../api/types'
+import type { BenchmarkCandidateOut, FetchResponse, InstitutionOut, IssuerMembershipOut, ScrapeRunOut, ScrapeSchedule } from '../../api/types'
 
 type ScrapeType = InstitutionOut['scrape_type']
 const SCRAPERS: Array<{ value: ScrapeType; label: string }> = [
@@ -33,22 +33,27 @@ export default function SourcesPage() {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [fetchResult, setFetchResult] = useState<FetchResponse | null>(null)
+  const [pollInterval, setPollInterval] = useState(3600)
+  const [schedule, setSchedule] = useState<ScrapeSchedule | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [sourcesRes, runsRes, grantsRes, benchmarkRes] = await Promise.all([
+      const [sourcesRes, runsRes, grantsRes, benchmarkRes, scheduleRes] = await Promise.all([
         api.get<InstitutionOut[]>('/ingest/sources'),
         api.get<ScrapeRunOut[]>('/ingest/runs'),
         api.get<IssuerMembershipOut[]>('/issuer-memberships'),
         api.get<BenchmarkCandidateOut[]>('/admin/benchmark/candidates'),
+        api.get<ScrapeSchedule>('/ingest/schedule'),
       ])
       setSources(sourcesRes.data)
       setRuns(runsRes.data)
       setIssuerGrants(grantsRes.data)
       setBenchmarkCandidates(benchmarkRes.data)
+      setPollInterval(scheduleRes.data.interval_seconds)
+      setSchedule(scheduleRes.data)
     } catch (err) {
       setError(errorMessage(err))
     } finally {
@@ -124,8 +129,29 @@ export default function SourcesPage() {
       setFetchResult(res.data)
       setMessage(
         `Poll complete: ${res.data.created} new, ${res.data.modified} revised, ` +
-        `${res.data.skipped} unchanged, ${res.data.errors} source errors.`,
+        `${res.data.skipped} unchanged, ${res.data.removed} removed from live listings, ` +
+        `${res.data.errors} source errors.`,
       )
+      await load()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const savePollInterval = async (ev: React.FormEvent) => {
+    ev.preventDefault()
+    setError('')
+    setMessage('')
+    setBusy(true)
+    try {
+      const res = await api.put<ScrapeSchedule>('/ingest/schedule', {
+        interval_seconds: pollInterval,
+      })
+      setPollInterval(res.data.interval_seconds)
+      setSchedule(res.data)
+      setMessage('Automatic polling interval saved. The next scheduled check has been updated.')
       await load()
     } catch (err) {
       setError(errorMessage(err))
@@ -196,6 +222,38 @@ export default function SourcesPage() {
           interval. You can also poll now. Live adapters use HTTPS, allow-listed
           hosts, robots rules, bounded downloads, retries and per-host spacing.
         </p>
+        <form className="row" onSubmit={savePollInterval}>
+          <label>
+            Automatic polling interval
+            <select
+              value={pollInterval}
+              onChange={(ev) => setPollInterval(Number(ev.target.value))}
+              disabled={busy}
+            >
+              <option value={1800}>Every 30 minutes</option>
+              <option value={3600}>Every hour</option>
+              <option value={7200}>Every 2 hours</option>
+              <option value={21600}>Every 6 hours</option>
+            </select>
+          </label>
+          <button type="submit" disabled={busy}>Save interval</button>
+        </form>
+        {schedule && (
+          <p className="muted">
+            {schedule.status === 'running'
+              ? `Automatic poll started ${schedule.last_attempted_at ? new Date(schedule.last_attempted_at).toLocaleString() : 'recently'}.`
+              : schedule.next_scheduled_at
+                ? `Next automatic poll: ${new Date(schedule.next_scheduled_at).toLocaleString()}.`
+                : 'The next automatic poll time is not available.'}
+            {schedule.last_completed_at && ` Last completed: ${new Date(schedule.last_completed_at).toLocaleString()}.`}
+          </p>
+        )}
+        {schedule?.last_error && (
+          <details className="error-details">
+            <summary>Latest poll warnings and errors</summary>
+            <p className="error">{schedule.last_error}</p>
+          </details>
+        )}
         <div className="row">
           <button onClick={triggerFetch} disabled={busy}>
             {busy ? 'Polling sources…' : 'Poll configured sources'}
@@ -207,10 +265,14 @@ export default function SourcesPage() {
           <ul>
             {fetchResult.institutions.map((item, index) => (
               <li key={`${String(item.slug)}-${index}`}>
-                {String(item.name)}: {String(item.status)} · {String(item.found)} found ·{' '}
-                {String(item.created)} new · {String(item.modified)} revised ·{' '}
-                {String(item.skipped)} unchanged
-                {item.error ? ` — ${String(item.error)}` : ''}
+                {item.name}: {item.status} · {item.found} found · {item.created} new ·{' '}
+                {item.modified} revised · {item.skipped} unchanged · {item.removed} removed
+                {item.error && (
+                  <details className="error-details">
+                    <summary>View source warnings</summary>
+                    <p className="error">{item.error}</p>
+                  </details>
+                )}
               </li>
             ))}
           </ul>
@@ -245,7 +307,7 @@ export default function SourcesPage() {
                     {latestRun ? (
                       <>
                         <div>{latestRun.status} · {latestRun.started_at ? new Date(latestRun.started_at).toLocaleString() : 'time unknown'}</div>
-                        {latestRun.error && <div className="error" title={latestRun.error}>{latestRun.error.slice(0, 180)}</div>}
+                        {latestRun.error && <details className="error-details"><summary>View warnings</summary><p className="error">{latestRun.error}</p></details>}
                       </>
                     ) : 'No recent poll in the latest 50 runs'}
                   </td>
@@ -350,7 +412,7 @@ export default function SourcesPage() {
               return <tr key={run.id}>
                 <td>{run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</td>
                 <td>{source?.name ?? `#${run.institution_id}`}</td>
-                <td>{run.status}</td><td>{run.found}</td><td>{run.created}</td><td>{run.modified}</td><td>{run.unchanged}</td><td>{run.error ?? '—'}</td>
+                <td>{run.status}</td><td>{run.found}</td><td>{run.created}</td><td>{run.modified}</td><td>{run.unchanged}</td><td>{run.error ? <details className="error-details"><summary>View details</summary><p className="error">{run.error}</p></details> : '—'}</td>
               </tr>
             })}</tbody>
           </table>
@@ -374,7 +436,7 @@ export default function SourcesPage() {
               value={sourceUrl}
               onChange={(ev) => setSourceUrl(ev.target.value)}
               placeholder={
-                scrapeType === 'thapar_html' ? 'https://www.thapar.edu/students/pages/dean-academics-notice-board'
+                scrapeType === 'thapar_html' ? 'https://www.thapar.edu/students/pages/student-notices'
                   : scrapeType === 'nitj_api' ? 'https://www.nitj.ac.in/api/academicnotices/get/all'
                     : scrapeType === 'iitb_html' ? 'https://acad.iitb.ac.in/circulars'
                       : scrapeType === 'vtu_examination' ? 'https://vtu.ac.in/category/examination/'

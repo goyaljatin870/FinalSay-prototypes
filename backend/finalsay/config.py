@@ -53,9 +53,13 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
 
     # Automatic public notice polling; set to 0 to disable the background poller.
-    # Poll public notice portals every two hours by default; this is frequent
-    # enough to catch multiple daily postings while respecting host throttling.
-    scrape_interval_seconds: int = Field(default=7_200, ge=0)
+    # Poll public notice portals hourly by default while respecting per-host
+    # throttling. Administrators can persist an override in ApplicationSetting.
+    scrape_interval_seconds: int = Field(default=3_600, ge=0)
+
+    # Optional Google service-account file for official Delhi catalog PDFs
+    # stored in Drive. The account needs read access to the linked files.
+    google_drive_service_account_file: str | None = None
 
     # Polygon Amoy on-chain anchoring (only used when anchor == "polygon").
     polygon_rpc_url: str | None = Field(

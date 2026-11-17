@@ -7,13 +7,14 @@ import hashlib
 import logging
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, local
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from finalsay.db import SessionLocal, engine
-from finalsay.models import ScrapeRun
+from finalsay.models import ApplicationSetting, ScrapeRun, ScrapeScheduleState
 from finalsay.services.document_extraction_backfill import (
     refresh_unknown_document_extractions,
 )
@@ -55,6 +56,58 @@ def _source_retry_delay(interval_seconds: int, failure_streak: int) -> int:
         _SOURCE_RETRY_BASE_SECONDS * (2**exponent),
     )
     return min(interval_seconds, retry_seconds)
+
+
+def _configured_interval_seconds(fallback: int) -> int:
+    """Read the admin override without making scheduler availability depend on it."""
+    db = SessionLocal()
+    try:
+        setting = db.get(ApplicationSetting, "scrape_interval_seconds")
+        if setting is None:
+            return fallback
+        value = int(setting.value)
+        return value if value > 0 else fallback
+    except Exception:  # noqa: BLE001 - retain env/default cadence if the setting store is unavailable
+        return fallback
+    finally:
+        db.close()
+
+
+def _wait_until_next_poll(
+    stop_event: Event,
+    interval_seconds: int,
+) -> bool:
+    """Wait on persisted due time and reload interval changes at least once/minute."""
+    while not stop_event.is_set():
+        db = SessionLocal()
+        try:
+            state = db.get(ScrapeScheduleState, 1)
+            if state is None:
+                state = ScrapeScheduleState(
+                    id=1,
+                    status="idle",
+                    next_scheduled_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                db.add(state)
+                db.commit()
+            if state.status == "running" or state.next_scheduled_at is None:
+                delay = 0
+            else:
+                due = state.next_scheduled_at
+                if due.tzinfo is not None:
+                    due = due.astimezone(timezone.utc).replace(tzinfo=None)
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                delay = max(0, int((due - now).total_seconds()))
+        except Exception:  # noqa: BLE001 - retry promptly if durable schedule is unavailable
+            db.rollback()
+            delay = 0
+        finally:
+            db.close()
+        if delay <= 0:
+            return False
+        if stop_event.wait(min(delay, 60)):
+            return True
+    return True
 
 
 def _has_transient_source_errors(summary: dict, extraction_summary: dict) -> bool:
@@ -186,13 +239,16 @@ def release_scrape_slot() -> None:
 
 
 def scheduled_scrape_loop(stop_event: Event, interval_seconds: int, logger: logging.Logger) -> None:
-    """Poll configured sources periodically without overlapping another poll.
+    """Run a durable, restart-resumable poll job without overlapping another poll.
 
-    The first poll runs on startup. Manual admin polling is also available
-    immediately through the API/UI and shares the same local and database lock.
+    A fresh installation gets an immediately due poll. Normal restarts retain
+    the persisted next due time. If a process dies mid-poll, the persisted
+    ``running`` state is retried as soon as this worker owns the shared lock.
     """
-    failure_streak = 0
     while not stop_event.is_set():
+        interval_seconds = _configured_interval_seconds(interval_seconds)
+        if _wait_until_next_poll(stop_event, interval_seconds):
+            break
         try:
             acquired = acquire_scrape_slot()
         except Exception:  # noqa: BLE001 - retry coordination outages next cycle
@@ -202,15 +258,30 @@ def scheduled_scrape_loop(stop_event: Event, interval_seconds: int, logger: logg
             continue
         if not acquired:
             logger.info("Skipping scheduled notice poll because another poll is active")
-            # A CLI/manual replay may hold the shared lock for many minutes.
-            # Retry soon after contention clears instead of silently missing
-            # the next scheduled poll for the entire normal interval.
             if stop_event.wait(min(interval_seconds, 60)):
                 break
             continue
-        next_delay = interval_seconds
         db = SessionLocal()
         try:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            state = db.get(ScrapeScheduleState, 1)
+            if state is None:
+                state = ScrapeScheduleState(id=1, status="idle", next_scheduled_at=now)
+                db.add(state)
+                db.flush()
+            if state.status != "running" and state.next_scheduled_at is not None:
+                due = state.next_scheduled_at
+                if due.tzinfo is not None:
+                    due = due.astimezone(timezone.utc).replace(tzinfo=None)
+                if due > now:
+                    # Admin may have changed the interval after the wait check.
+                    db.rollback()
+                    continue
+            failure_streak = state.failure_streak or 0
+            state.status = "running"
+            state.last_attempted_at = now
+            state.last_error = None
+            db.commit()
             summary = fetch_all(
                 db, include_fixtures=False, commit_each_source=True
             )
@@ -218,7 +289,7 @@ def scheduled_scrape_loop(stop_event: Event, interval_seconds: int, logger: logg
                 db, per_institution=2
             )
             _persist_document_extraction_errors(db, extraction_refresh, logger)
-            db.commit()
+            interval_seconds = _configured_interval_seconds(interval_seconds)
             if _has_transient_source_errors(summary, extraction_refresh):
                 failure_streak += 1
                 next_delay = _source_retry_delay(interval_seconds, failure_streak)
@@ -229,6 +300,24 @@ def scheduled_scrape_loop(stop_event: Event, interval_seconds: int, logger: logg
                 )
             else:
                 failure_streak = 0
+                next_delay = interval_seconds
+            state = db.get(ScrapeScheduleState, 1)
+            state.status = (
+                "partial"
+                if summary.get("errors") or extraction_refresh.get("errors")
+                else "ok"
+            )
+            state.last_completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            state.failure_streak = failure_streak
+            state.next_scheduled_at = state.last_completed_at + timedelta(seconds=next_delay)
+            errors = [
+                f"{item.get('name') or item.get('slug')}: {item['error']}"
+                for item in summary.get("institutions", [])
+                if item.get("error")
+            ]
+            errors.extend(str(error) for error in extraction_refresh.get("errors", []))
+            state.last_error = " | ".join(errors)[:4_000] or None
+            db.commit()
             logger.info(
                 "Scheduled notice poll completed: created=%d modified=%d unchanged=%d errors=%d extractions=%d extraction_errors=%d",
                 summary["created"], summary["modified"], summary["skipped"], summary["errors"],
@@ -236,11 +325,19 @@ def scheduled_scrape_loop(stop_event: Event, interval_seconds: int, logger: logg
             )
         except Exception:  # noqa: BLE001 - scheduler must survive a failed cycle
             db.rollback()
-            failure_streak += 1
-            next_delay = _source_retry_delay(interval_seconds, failure_streak)
             logger.exception("Scheduled notice poll failed")
+            try:
+                state = db.get(ScrapeScheduleState, 1)
+                if state is not None:
+                    state.failure_streak = (state.failure_streak or 0) + 1
+                    delay = _source_retry_delay(interval_seconds, state.failure_streak)
+                    state.status = "error"
+                    state.last_completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    state.next_scheduled_at = state.last_completed_at + timedelta(seconds=delay)
+                    state.last_error = "Scheduled notice poll failed; see backend logs for details."
+                    db.commit()
+            except Exception:
+                db.rollback()
         finally:
             db.close()
             release_scrape_slot()
-        if stop_event.wait(next_delay):
-            break

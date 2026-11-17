@@ -22,8 +22,10 @@ or remove old notice history. Re-running it is safe.
 
 ## Polling and manual refresh
 
-The FastAPI process polls enabled live sources every two hours by default
-(FINALSAY_SCRAPE_INTERVAL_SECONDS, default 7200). A poll writes created or
+The FastAPI process polls enabled live sources every hour by default
+(FINALSAY_SCRAPE_INTERVAL_SECONDS, default 3600). Admins can change the
+persistent interval from Admin → Sources (30 minutes, 1 hour, 2 hours, or
+6 hours); the scheduler reloads changes within one minute. A poll writes created or
 revised notices through the regular extraction/versioning path and records a
 ScrapeRun row for each source. Repeated polls use stable source URLs and
 content hashes to avoid duplicate current records; a partial unique database
@@ -36,8 +38,9 @@ backend environment.
 An admin can also open /admin/sources and select **Fetch notices now**. The
 same operation is available at POST /api/ingest/fetch with an admin bearer
 token. The API schema restricts each adapter to its institution host; the
-scraper follows only bounded same-site pagination and does not fetch
-third-party-hosted attachments.
+scraper follows bounded same-site pagination. Delhi Drive PDFs use a separate,
+canonical-link-only Google Drive API path when its read-only service account is
+configured.
 
 ## Verified local state (10 November 2026)
 
@@ -141,18 +144,18 @@ Older inactive Thapar/IIT Bombay records still have 26 missing dates in total.
 ## Current limitations
 
 The University of Delhi page links some attachments through Google Drive. For
-those entries, FinalSay indexes the official listing title, date, and link, but
-does not download the third-party file. A broken PDF also falls back to listing
+those entries, FinalSay indexes the official listing title, date, and link. A
+read-only Google Drive API credential is required to download and extract the
+PDF; without it, the record remains listing-only and the poll reports that
+document text was unavailable. A broken PDF also falls back to listing
 metadata and is recorded as a partial scrape. Mumbai PDF circulars are parsed
 as before; JPG/JPEG/PNG scans now use bounded OCR. Executable suffixes and
 filename-like suspicious titles are skipped instead of indexed as notice
 metadata. Persisted extraction quality distinguishes extracted documents,
-listing-only fallbacks, and unknown legacy rows. A direct-download probe on
-two publicly linked Delhi files redirected to `drive.usercontent.google.com`;
-both advertised files over the scraper's 20-MB response cap. Google's published
-robots policy disallows `/uc` downloads on `drive.google.com` and all paths on
-`drive.usercontent.google.com`, so FinalSay preserves listing metadata and
-does not fetch those files. Among current selected-source notices, 695 are
+listing-only fallbacks, and unknown legacy rows. FinalSay does not use direct
+web downloads for Drive attachments; its optional integration uses the official
+read-only API and accepts only file IDs found on the Delhi catalog. Among
+current selected-source notices, 695 are
 classified as extracted, 207 as listing-only, 558 as unknown and one as
 unextractable. The Admin Sources table reports extraction counts per
 institution as polling continues.
@@ -199,3 +202,53 @@ separate-process test verifies SQLite poll serialization. DNS validation retries
 temporary lookup errors up to three times without relaxing host allowlists or
 public-IP checks. The focused live-adapter test passes, and the latest startup
 poll completed without DNS resolution errors.
+### University of Delhi files stored in Google Drive
+
+The Delhi notices catalog sometimes points to public or institution-shared PDFs
+on Google Drive. FinalSay stores the official catalog row even when the PDF is
+not readable. To extract these PDFs from the backend, configure a Google Cloud
+service account with the Drive API enabled and grant it read access to the
+official files (or ensure the official files are publicly readable). Set:
+
+```dotenv
+FINALSAY_GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE=/secure/path/finalsay-drive-reader.json
+```
+
+The adapter requests only the Drive `drive.readonly` scope, accepts only
+canonical Drive file links found on the Delhi official catalog, limits downloads
+to 20 MB, and keeps the original Drive URL as provenance. The service-account
+file must stay outside the repository and must not be committed. Without this
+setting, the portal listing remains searchable and the poll reports the
+attachment as listing-only; the comparison must not claim that document dates
+were verified.
+
+The catalog's own same-host PDF links can still return HTTP 404. Those are
+retained as listing-only records and reported as source attachment failures;
+FinalSay does not invent replacement URLs.
+
+Large paginated catalog snapshots are now scanned in bounded slices across
+polls. Removal detection runs only after a complete snapshot, preventing a
+partial page or temporary fetch failure from marking older notices removed.
+Where an official PDF server supplies an ETag or Last-Modified header,
+subsequent polls send conditional requests and accept HTTP 304 as confirmation
+that the stored document bytes are still current. The poll stores those source
+validators separately from the notice hash. VTU and Mumbai process the 10 most
+recent records plus a 10-record bounded historical batch per poll.
+
+## Latest live poll (16 November 2026)
+
+The backend's scheduled cycle completed as runs 365–368: VTU `ok` (20 found,
+10 new, 10 unchanged), Delhi `partial` (20 found, all unchanged), Mumbai
+`partial` (50 found, 25 new and 25 unchanged), and Thapar `ok` (0 found). The
+cycle created 35 records, revised none, and reported two source/document
+quality errors. Delhi listed some Google Drive PDFs but no Drive API service
+account is configured; five same-host attachment URLs returned HTTP 404.
+Mumbai had one PDF with no extractable text. The run recorded backfill cursors
+and did not report duplicate insertions.
+
+This real cycle took about 110 minutes (VTU ~66 min, Mumbai ~43 min). The new
+smaller document batches and HTTP validators are intended to reduce future
+cycles, but this improvement is not yet live-verified: the first run after the
+change must establish validators for existing rows. The previous one-off poll
+attempt from a restricted execution context hit transient DNS resolution
+failures; the API scheduler retried and completed its subsequent source cycle.

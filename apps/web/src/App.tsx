@@ -12,6 +12,7 @@ import QueuePage from './pages/reviewer/QueuePage'
 import CasePage from './pages/reviewer/CasePage'
 import BenchmarkPage from './pages/reviewer/BenchmarkPage'
 import SourcesPage from './pages/admin/SourcesPage'
+import AdminNoticesPage from './pages/admin/NoticesPage'
 import ProvenancePage from './pages/admin/ProvenancePage'
 import PublishPage from './pages/issuer/PublishPage'
 import CollegeOnboardingPage from './pages/CollegeOnboardingPage'
@@ -116,6 +117,14 @@ export default function App() {
             element={
               <ProtectedRoute roles={['admin']}>
                 <SourcesPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/notices"
+            element={
+              <ProtectedRoute roles={['admin']}>
+                <AdminNoticesPage />
               </ProtectedRoute>
             }
           />

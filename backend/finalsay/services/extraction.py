@@ -28,6 +28,10 @@ class OcrUnavailable(RuntimeError):
     """
 
 
+class InvalidDocumentError(ValueError):
+    """Raised when an uploaded document is empty, corrupt, or unreadable."""
+
+
 @dataclass
 class ExtractionResult:
     """Result of the extraction pipeline.
@@ -123,15 +127,29 @@ def _is_file(path: str) -> bool:
 
 def text_from_pdf(data: bytes) -> str:
     """Extract PDF text, using OCR for blank or clearly damaged text layers."""
+    if not data:
+        raise InvalidDocumentError(
+            "The uploaded PDF is empty. Upload a readable PDF or paste the notice text."
+        )
     from pypdf import PdfReader
+    from pypdf.errors import PyPdfError
 
-    reader = PdfReader(io.BytesIO(data), strict=False)
-    parts = [(page.extract_text() or "") for page in reader.pages[:30]]
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        parts = [(page.extract_text() or "") for page in reader.pages[:30]]
+    except (PyPdfError, OSError, ValueError) as exc:
+        raise InvalidDocumentError(
+            "The uploaded PDF could not be read. Upload a valid, unencrypted PDF or paste the notice text."
+        ) from exc
     embedded = "\n".join(parts).strip()[:30_000]
     if not embedded or _pdf_text_needs_ocr(embedded):
         scanned = _ocr_pdf(data)
         if _usable_ocr(scanned, embedded):
             return scanned[:30_000]
+    if not embedded:
+        raise InvalidDocumentError(
+            "No readable text was found in this PDF. Upload a text-readable copy or paste the notice text."
+        )
     return embedded
 
 
@@ -197,10 +215,15 @@ def text_from_image(data: bytes, *, timeout: int | None = None) -> str:
             "No Tesseract OCR engine is available. Please paste the notice text instead."
         )
     import pytesseract
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
     pytesseract.pytesseract.tesseract_cmd = cmd
-    image = Image.open(io.BytesIO(data))
+    try:
+        image = Image.open(io.BytesIO(data))
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise InvalidDocumentError(
+            "The uploaded image could not be read. Upload a valid PNG, JPEG, GIF, or WebP image."
+        ) from exc
     return _tesseract_image_to_string(image, pytesseract, timeout=timeout)
 
 

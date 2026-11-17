@@ -127,7 +127,9 @@ manually, and browse that source's collected notices from **Admin → Sources**.
 The page shows the last successful poll and its new/revised/unchanged counts;
 recent errors remain visible in the scrape history. Active, enabled sources are
 also polled on startup and every `FINALSAY_SCRAPE_INTERVAL_SECONDS` (default
-two hours). Manual and scheduled polls share a lock, and transient HTTP errors
+one hour). Admins can change the interval from **Admin → Sources**; the saved
+setting is read by the running scheduler and survives restarts. Manual and
+scheduled polls share a lock, and transient HTTP errors
 receive bounded retries. Repeated unchanged documents are deduplicated;
 modified documents are stored as linked versions. Active adapters are
 allow-listed for VTU, University of Delhi Examination, and University of

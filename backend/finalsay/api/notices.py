@@ -42,7 +42,9 @@ def list_notices(
     if kind not in {"official", "submission"}:
         raise HTTPException(status_code=422, detail="kind must be official or submission")
     query = select(Notice).where(Notice.kind == kind).order_by(Notice.id.desc())
-    query = query.where(Notice.is_current.is_(True))
+    query = query.where(Notice.is_current.is_(True), Notice.admin_status == "active")
+    if kind == "official":
+        query = query.where(Notice.source_state == "active")
     if kind == "official" and current_user.role == "student":
         if current_user.institution_id is None:
             raise HTTPException(
@@ -107,6 +109,8 @@ def student_notice_feed(
         Notice.kind == "official",
         Notice.is_current.is_(True),
         Notice.institution_id == institution.id,
+        Notice.admin_status == "active",
+        Notice.source_state == "active",
     )
     date_rows = db.execute(
         select(Notice.published_on, func.count(Notice.id))
@@ -114,6 +118,8 @@ def student_notice_feed(
             Notice.kind == "official",
             Notice.is_current.is_(True),
             Notice.institution_id == institution.id,
+            Notice.admin_status == "active",
+            Notice.source_state == "active",
         )
         .group_by(Notice.published_on)
     ).all()

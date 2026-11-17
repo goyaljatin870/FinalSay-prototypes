@@ -62,6 +62,32 @@ class Institution(Base):
     notices: Mapped[list["Notice"]] = relationship(back_populates="institution")
 
 
+class ApplicationSetting(Base):
+    """Small persistent store for operator-configurable runtime settings."""
+
+    __tablename__ = "application_setting"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(String(500), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class ScrapeScheduleState(Base):
+    """Durable state for the single shared automatic source-poll job."""
+
+    __tablename__ = "scrape_schedule_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="idle", nullable=False)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    next_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    failure_streak: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class User(Base):
     __tablename__ = "user"
 
@@ -119,12 +145,22 @@ class Notice(Base):
     redacted_text: Mapped[str | None] = mapped_column(Text)
     source_url: Mapped[str | None] = mapped_column(String(500))
     source_key: Mapped[str | None] = mapped_column(String(500), index=True)
+    source_document_url: Mapped[str | None] = mapped_column(String(1_000))
+    source_etag: Mapped[str | None] = mapped_column(String(500))
+    source_last_modified: Mapped[str | None] = mapped_column(String(200))
     # Hash of the exact fetched source document when an adapter exposes it.
     # Separate from ``sha256``, which commits the normalized notice text.
     source_content_sha256: Mapped[str | None] = mapped_column(String(64))
     extraction_quality: Mapped[str] = mapped_column(
         String(24), default="unknown", nullable=False
     )
+    source_state: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    source_last_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_removed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    admin_status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    admin_review_note: Mapped[str | None] = mapped_column(Text)
+    admin_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    admin_reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("user.id"))
     version_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     previous_version_id: Mapped[int | None] = mapped_column(ForeignKey("notice.id"))
@@ -291,6 +327,9 @@ class ScrapeProgress(Base):
     )
     cursor: Mapped[str | None] = mapped_column(String(1_000))
     backfill_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    snapshot_cursor: Mapped[str | None] = mapped_column(String(1_000))
+    snapshot_keys_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    snapshot_completed_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 

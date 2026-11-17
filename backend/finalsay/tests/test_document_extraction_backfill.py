@@ -116,6 +116,46 @@ def test_refresh_skips_external_host_without_fetching_it(db_session, monkeypatch
     assert db_session.query(NoticeDocumentExtraction).count() == 0
 
 
+def test_refresh_can_extract_canonical_drive_file_when_adapter_has_api_access(db_session, monkeypatch):
+    institution, notice = _unknown_notice(
+        db_session,
+        scrape_type="du_examination",
+        source_url="https://drive.google.com/file/d/abc/view?usp=drive_link",
+    )
+
+    class SourceAdapter:
+        allowed_hosts = {"exam.du.ac.in"}
+
+        @staticmethod
+        def _drive_file_id(url):
+            return "abc" if "/file/d/abc/view" in url else None
+
+        def _drive_pdf(self, url, title, date=None):
+            assert url == notice.source_url
+            assert title == notice.title
+            return RawNotice(
+                text="Official University of Delhi notice, certificate course, dated 07 October 2026.",
+                source_url=url,
+                institution_slug=institution.slug,
+                external_id=url,
+                metadata={"extraction_quality": "extracted"},
+            )
+
+    monkeypatch.setattr(backfill, "create_live_adapter", lambda _institution: SourceAdapter())
+
+    result = backfill.refresh_unknown_document_extractions(
+        db_session, per_institution=1
+    )
+
+    extraction_row = db_session.query(NoticeDocumentExtraction).one()
+    assert result["stored"] == 1
+    assert result["skipped_external"] == 0
+    assert extraction_row.notice_id == notice.id
+    assert "07 October 2026" in extraction_row.extracted_text
+    assert notice.sha256 == "original-official-notice-hash"
+    assert notice.version_no == 1
+
+
 def test_refresh_returns_institution_scoped_extraction_errors(db_session, monkeypatch):
     institution, notice = _unknown_notice(db_session)
 

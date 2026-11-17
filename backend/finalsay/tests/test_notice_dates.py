@@ -10,6 +10,9 @@ from finalsay.services.notice_dates import parse_publication_date
     [
         ("2026-11-01", date(2026, 11, 1)),
         ("01 Nov 2026", date(2026, 11, 1)),
+        ("12th Nov 2026", date(2026, 11, 12)),
+        ("19th August 2026", date(2026, 8, 19)),
+        ("Dated: 1st January 2026", date(2026, 1, 1)),
         ("10 November 2026", date(2026, 11, 10)),
         ("01/11/2026", date(2026, 11, 1)),
         ("Dated: 01.11.2026", date(2026, 11, 1)),

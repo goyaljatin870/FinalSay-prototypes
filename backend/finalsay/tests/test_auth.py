@@ -75,6 +75,21 @@ def test_duplicate_registration_conflicts(client: TestClient):
     assert duplicate.json()["detail"] == "Email already registered"
 
 
+def test_registration_rejects_malformed_email_and_short_password(client: TestClient):
+    malformed_email = client.post(
+        "/api/auth/register",
+        json={"email": "not-an-email", "password": "secret123"},
+    )
+    short_password = client.post(
+        "/api/auth/register",
+        json={"email": "valid@example.com", "password": "12345"},
+    )
+
+    assert malformed_email.status_code == 422
+    assert short_password.status_code == 422
+    assert client.get("/api/auth/me").status_code == 401
+
+
 def test_database_failure_during_registration_is_sanitized(client: TestClient, monkeypatch):
     def fail_commit(_self):
         raise SQLAlchemyError("sensitive database driver detail")
@@ -92,6 +107,13 @@ def test_login_wrong_password(client: TestClient):
     _register(client, "wrong@example.com", "s3cret1")
     resp = _login(client, "wrong@example.com", "nope")
     assert resp.status_code == 401
+
+
+def test_login_empty_credentials_are_rejected(client: TestClient):
+    response = client.post(
+        "/api/auth/login", data={"username": "", "password": ""}
+    )
+    assert response.status_code == 422
 
 
 def test_me_requires_auth(client: TestClient):
