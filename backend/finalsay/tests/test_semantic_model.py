@@ -56,6 +56,16 @@ def test_date_parser_handles_indian_dotted_deadlines():
     assert _date_values("Deadline extended up to 15.11.2026") == {(11, 15, 2026)}
 
 
+def test_date_parser_normalizes_common_student_claim_formats():
+    for value in (
+        "30 November",
+        "30 Nov 2026",
+        "30/11/2026",
+        "2026-11-30",
+    ):
+        assert _date_values(value) == {(11, 30, 2026) if "2026" in value else (11, 30, None)}
+
+
 def test_extension_word_outside_the_supported_claim_pair_does_not_change_label():
     model = SemanticComparisonModel()
     official_ref = "VII/2026/02 dated % September, 2026"

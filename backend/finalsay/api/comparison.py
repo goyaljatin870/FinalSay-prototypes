@@ -60,4 +60,6 @@ def compare(
         candidate_source_url=outcome.candidate.source_url if outcome.candidate else None,
         candidate_text=outcome.candidate.redacted_text if outcome.candidate else None,
         evidence=outcome.evidence,
+        student_summary=outcome.student_summary,
+        student_verdict=outcome.student_verdict,
     )

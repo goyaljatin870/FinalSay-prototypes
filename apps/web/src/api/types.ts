@@ -89,7 +89,50 @@ export interface StudentNoticeItem extends NoticeSummary {
   preview: string | null
 }
 
+export interface FollowedNotice {
+  notice: NoticeSummary
+  followed_at: string
+}
+
+export interface CategoryFollow {
+  id: number
+  institution_id: number
+  category_key: string
+  category_label: string
+  created_at: string
+}
+
+export interface StudentFollows {
+  notices: FollowedNotice[]
+  categories: CategoryFollow[]
+}
+
+export interface StudentNotification {
+  id: number
+  kind: string
+  title: string
+  message: string
+  notice_id: number | null
+  previous_notice_id: number | null
+  notice_title: string | null
+  previous_notice_title: string | null
+  source_url: string | null
+  created_at: string
+  read_at: string | null
+  old_value: string | null
+  new_value: string | null
+}
+
+export interface StudentNotificationPage {
+  items: StudentNotification[]
+  total: number
+  unread_count: number
+  page: number
+  page_size: number
+}
+
 export interface NoticeDetail extends NoticeSummary {
+  submission_mode: 'claim' | 'document' | 'legacy'
   action: string | null
   redacted_text: string | null
   fields: NoticeFieldOut[]
@@ -122,6 +165,8 @@ export interface ComparisonResponse {
   candidate_text?: string | null
   candidate_supplemental_extractions?: NoticeDocumentExtractionOut[]
   evidence?: string[]
+  student_summary?: string | null
+  student_verdict?: 'CONFIRMED' | 'CONTRADICTED' | 'PARTIALLY_SUPPORTED' | 'NOT_FOUND' | 'NEEDS_MANUAL_VERIFICATION'
 }
 
 export interface VerifyResponse {
@@ -224,6 +269,21 @@ export interface AdminNotice extends NoticeSummary {
   admin_review_note: string | null
   admin_reviewed_at: string | null
   admin_reviewed_by: number | null
+}
+
+export interface AdminOfficialNoticeWrite {
+  institution_id: number
+  title: string
+  text: string
+  source_url?: string | null
+  published_date?: string | null
+}
+
+export interface AdminOfficialNoticeRevision {
+  title?: string | null
+  text: string
+  source_url?: string | null
+  published_date?: string | null
 }
 
 export interface AdminNoticePage {

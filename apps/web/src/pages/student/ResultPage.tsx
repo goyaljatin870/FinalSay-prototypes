@@ -8,11 +8,14 @@ import type {
   VerifyResponse,
 } from '../../api/types'
 import { loadResult, saveResult } from '../../api/resultCache'
+import { useNoticeFollows } from '../../hooks/useNoticeFollows'
+import { useAuth } from '../../auth/AuthContext'
 
 // Keep the first screen readable for students; evidence and machine details
 // remain available in collapsed sections for reviewers and technical users.
 export default function ResultPage() {
   const { id } = useParams<{ id: string }>()
+  const { user } = useAuth()
   const submissionId = Number(id)
 
   const [submission, setSubmission] = useState<NoticeDetail | null>(null)
@@ -23,6 +26,8 @@ export default function ResultPage() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
   const [verifying, setVerifying] = useState(false)
+  const [rechecking, setRechecking] = useState(false)
+  const { noticeIds, busyIds, toggle: toggleFollow } = useNoticeFollows(user?.role === 'student')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -90,6 +95,28 @@ export default function ResultPage() {
     }
   }
 
+  const recheckSubmission = async () => {
+    setRechecking(true)
+    setError('')
+    try {
+      const refreshed = await api.post<ComparisonResponse>(`/compare/${submissionId}`)
+      setOutcome(refreshed.data)
+      saveResult(refreshed.data)
+      const [ranked, official] = await Promise.all([
+        api.get<CandidateOut[]>(`/notices/${submissionId}/candidates`),
+        refreshed.data.candidate_id
+          ? api.get<NoticeDetail>(`/notices/${refreshed.data.candidate_id}`)
+          : Promise.resolve(null),
+      ])
+      setCandidates(ranked.data)
+      setMatchedNoticeDetail(official?.data ?? null)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRechecking(false)
+    }
+  }
+
   if (loading) return <p className="muted">Loading result…</p>
   if (error && !submission) return <p className="error">{error}</p>
   if (!submission) return <p className="muted">No submission found.</p>
@@ -97,7 +124,11 @@ export default function ResultPage() {
   const topCandidate = candidates[0]
   const matchedCandidate = candidates.find(
     (item) => item.notice.id === outcome?.candidate_id,
-  )?.notice ?? topCandidate?.notice
+  )?.notice ?? (
+    outcome?.candidate_id && matchedNoticeDetail?.id === outcome.candidate_id
+      ? matchedNoticeDetail
+      : outcome?.candidate_id ? undefined : topCandidate?.notice
+  )
   const hasExtractedSourceDocument = Boolean(
     outcome?.candidate_supplemental_extractions?.some(
       (item) => item.extraction_quality === 'extracted' && item.extracted_text.trim(),
@@ -129,8 +160,39 @@ export default function ResultPage() {
   const exactTextMatch = Boolean(
     normalizedSubmissionText && normalizedOfficialText && normalizedSubmissionText === normalizedOfficialText,
   )
+  const isTypedClaim = Boolean(
+    (submission.submission_mode === 'claim' || (submission.submission_mode === 'legacy' && !submission.title &&
+      (submission.redacted_text || '').length <= 900 &&
+      !/\b(?:notice|notification|circular|issued by|university|registrar|subject:)\b/i.test(submission.redacted_text || ''))),
+  )
 
   const resultCopy = (() => {
+    if (outcome?.student_verdict) {
+      const copy = {
+        CONFIRMED: { heading: 'This information matches the official notice', next: 'Open the official notice to check the full instructions.' },
+        CONTRADICTED: { heading: 'This detail conflicts with the official notice', next: 'Follow the official notice. Contact your college if you need clarification.' },
+        PARTIALLY_SUPPORTED: { heading: 'Some details are supported; others are unclear', next: 'Check the official notice and confirm the unclear detail with your college.' },
+        NOT_FOUND: { heading: 'No matching official notice was found', next: 'Check again later or ask your college office to confirm.' },
+        NEEDS_MANUAL_VERIFICATION: { heading: 'A possible notice needs a closer check', next: 'Open the source or ask your college office to confirm.' },
+      }[outcome.student_verdict]
+      const documentBody = listingOnlyMatch
+        ? 'A related portal listing was found, but FinalSay could not read the official document. Its details need manual checking.'
+        : outcome.label === 'consistent'
+          ? exactTextMatch
+            ? 'The text in your copy is the same as the readable official notice.'
+            : 'No important difference was found in the readable official notice.'
+          : outcome.label === 'superseded'
+            ? 'The institution published a newer notice. Follow its latest instructions.'
+            : outcome.label === 'extended'
+              ? 'The institution published a later deadline.'
+              : outcome.label === 'corrected'
+                ? 'The institution published a correction. Follow the corrected details.'
+                : 'Review the source below before acting on this result.'
+      return {
+        ...copy,
+        body: outcome.student_summary || documentBody,
+      }
+    }
     if (listingOnlyMatch) {
       return {
         heading: 'Possible match; details could not be checked',
@@ -189,8 +251,12 @@ export default function ResultPage() {
         <p className="muted result-submission-id">Submission #{submission.id}</p>
         {outcome ? (
           <div className="stack-sm result-summary">
+            {outcome.student_verdict && <p className="eyebrow">{outcome.student_verdict.replace(/_/g, ' ')}</p>}
             <h2>{resultCopy.heading}</h2>
             <p>{resultCopy.body}</p>
+            <button type="button" className="btn-secondary" disabled={rechecking} onClick={() => void recheckSubmission()}>
+              {rechecking ? 'Checking current notices…' : 'Recheck against current notices'}
+            </button>
           </div>
         ) : (
           <p className="muted">A comparison result is not available for this submission yet.</p>
@@ -199,15 +265,29 @@ export default function ResultPage() {
           <section className="result-match">
             <p className="eyebrow">OFFICIAL NOTICE MATCH</p>
             <h2>{matchedCandidate.title || `Official notice #${matchedCandidate.id}`}</h2>
-            <p className="muted">{outcome?.candidate_institution || 'Your selected institution'} · Notice #{matchedCandidate.id}</p>
+            <p className="muted">{outcome?.candidate_institution || 'Your selected institution'} · Notice #{matchedCandidate.id}{matchedCandidate.published_date ? ` · Published ${matchedCandidate.published_date}` : ''}</p>
             {outcome?.candidate_source_url && (
               <p><a href={outcome.candidate_source_url} target="_blank" rel="noreferrer">Open official source ↗</a></p>
             )}
+            {user?.role === 'student' && <button
+              type="button"
+              className="btn-secondary"
+              disabled={busyIds.has(matchedCandidate.id)}
+              onClick={() => void toggleFollow(matchedCandidate.id).catch((err) => setError(errorMessage(err)))}
+            >
+              {busyIds.has(matchedCandidate.id) ? 'Saving…' : noticeIds.has(matchedCandidate.id) ? 'Following this notice' : 'Follow this notice'}
+            </button>}
           </section>
         )}
-        {matchedCandidate && (
+        {isTypedClaim && submission.redacted_text?.trim() && (
           <section className="result-differences">
-            <h3>What differs from your copy?</h3>
+            <p className="eyebrow">YOUR CLAIM</p>
+            <blockquote>{submission.redacted_text}</blockquote>
+          </section>
+        )}
+        {matchedCandidate && !outcome?.student_summary && (
+          <section className="result-differences">
+            <h3>{submission.title ? 'What differs from your copy?' : 'What the official notice says'}</h3>
             {listingOnlyMatch ? (
               <>
                 <p>FinalSay recognized the topic, but couldn’t read the official PDF. So it couldn’t verify whether dates or other details in your copy were changed.</p>
@@ -255,7 +335,11 @@ export default function ResultPage() {
         <p>{outcome?.rationale || 'No comparison explanation is available.'}</p>
         {outcome?.gated && <p className="muted">This result was sent for a closer review. It is not a finding that your notice is fake.</p>}
         {outcome?.evidence && outcome.evidence.length > 0 && <ul>{outcome.evidence.map((item, index) => <li key={index}>{item}</li>)}</ul>}
-        {outcome?.confidence != null && <p className="muted">Technical model score: {outcome.confidence.toFixed(3)} (not a probability).</p>}
+        {outcome?.model === 'claim-schedule-evidence' ? (
+          <p className="muted">This verdict comes from the matched schedule row; no model score was used.</p>
+        ) : outcome?.confidence != null && outcome.model !== 'claim-manual-review' ? (
+          <p className="muted">Technical model score: {outcome.confidence.toFixed(3)} (not a probability).</p>
+        ) : null}
         <p className="muted">Comparison model: {outcome?.model || 'not available'}</p>
       </details>
 

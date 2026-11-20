@@ -19,14 +19,16 @@ def test_existing_notice_table_gets_defaulted_extraction_quality_column(tmp_path
 
         columns = {column["name"]: column for column in inspect(engine).get_columns("notice")}
         assert "extraction_quality" in columns
+        assert "submission_mode" in columns
         with engine.begin() as connection:
             connection.exec_driver_sql(
                 "INSERT INTO notice (id, kind) VALUES (1, 'official')"
             )
-            quality = connection.exec_driver_sql(
-                "SELECT extraction_quality FROM notice WHERE id = 1"
-            ).scalar_one()
+            quality, submission_mode = connection.exec_driver_sql(
+                "SELECT extraction_quality, submission_mode FROM notice WHERE id = 1"
+            ).one()
         assert quality == "unknown"
+        assert submission_mode == "legacy"
     finally:
         engine.dispose()
 

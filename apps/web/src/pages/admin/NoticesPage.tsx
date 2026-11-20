@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { api, errorMessage } from '../../api/client'
-import type { AdminNotice, AdminNoticePage, InstitutionOut } from '../../api/types'
+import type { AdminNotice, AdminNoticePage, AdminOfficialNoticeWrite, InstitutionOut } from '../../api/types'
 
 const STATUSES = ['active', 'flagged', 'archived', 'rejected'] as const
 
@@ -14,6 +14,12 @@ export default function AdminNoticesPage() {
   const [query, setQuery] = useState('')
   const [error, setError] = useState('')
   const [busyId, setBusyId] = useState<number | null>(null)
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [noticeDraft, setNoticeDraft] = useState<AdminOfficialNoticeWrite>({
+    institution_id: 0, title: '', text: '', source_url: '', published_date: '',
+  })
+  const [editDraft, setEditDraft] = useState({ title: '', text: '', source_url: '', published_date: '' })
+  const [saving, setSaving] = useState(false)
   const pageSize = 25
 
   const load = useCallback(async () => {
@@ -57,6 +63,45 @@ export default function AdminNoticesPage() {
     }
   }
 
+  const createNotice = async (event: FormEvent) => {
+    event.preventDefault()
+    setSaving(true)
+    setError('')
+    try {
+      await api.post('/admin/notices', noticeDraft)
+      setNoticeDraft({ institution_id: 0, title: '', text: '', source_url: '', published_date: '' })
+      await load()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const beginEdit = (notice: AdminNotice) => {
+    setEditingId(notice.id)
+    setEditDraft({
+      title: notice.title || '',
+      text: notice.redacted_text || '',
+      source_url: notice.source_url || '',
+      published_date: notice.published_date || '',
+    })
+  }
+
+  const saveRevision = async (notice: AdminNotice) => {
+    setBusyId(notice.id)
+    setError('')
+    try {
+      await api.put(`/admin/notices/${notice.id}/content`, editDraft)
+      setEditingId(null)
+      await load()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
 
   return (
@@ -86,6 +131,22 @@ export default function AdminNoticesPage() {
           <button type="submit">Search</button>
         </form>
         {error && <p className="error" role="alert">{error}</p>}
+        <details className="admin-create-notice">
+          <summary>Publish an official notice</summary>
+          <form className="stack-sm" onSubmit={(event) => void createNotice(event)}>
+            <label>Institution<select required value={noticeDraft.institution_id || ''} onChange={(event) => setNoticeDraft((draft) => ({ ...draft, institution_id: Number(event.target.value) }))}>
+              <option value="">Choose institution</option>
+              {sources.filter((source) => source.active && source.scrape_type !== 'fixture').map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+            </select></label>
+            <label>Notice title<input required minLength={3} maxLength={500} value={noticeDraft.title} onChange={(event) => setNoticeDraft((draft) => ({ ...draft, title: event.target.value }))} /></label>
+            <label>Official content<textarea required rows={7} maxLength={100000} value={noticeDraft.text} onChange={(event) => setNoticeDraft((draft) => ({ ...draft, text: event.target.value }))} /></label>
+            <div className="row">
+              <label>Publication date<input value={noticeDraft.published_date || ''} onChange={(event) => setNoticeDraft((draft) => ({ ...draft, published_date: event.target.value }))} placeholder="e.g. 12 Nov 2026" /></label>
+              <label>Official source URL<input type="url" value={noticeDraft.source_url || ''} onChange={(event) => setNoticeDraft((draft) => ({ ...draft, source_url: event.target.value }))} /></label>
+            </div>
+            <button type="submit" disabled={saving || !noticeDraft.institution_id || noticeDraft.text.trim().length === 0}>{saving ? 'Publishing…' : 'Publish notice'}</button>
+          </form>
+        </details>
         <p className="muted">{total} notices · page {page} of {pageCount}</p>
         {items.length === 0 ? <p className="muted">No notices match these filters.</p> : (
           <div className="table-scroll">
@@ -97,6 +158,15 @@ export default function AdminNoticesPage() {
                     <strong>{notice.title || `Official notice #${notice.id}`}</strong>
                     <div className="muted">{sources.find((source) => source.id === notice.institution_id)?.name || `Institution #${notice.institution_id ?? '—'}`} · #{notice.id}</div>
                     {notice.source_url && <a href={notice.source_url} target="_blank" rel="noreferrer">Open source ↗</a>}
+                    {editingId === notice.id ? (
+                      <div className="stack-sm admin-notice-editor">
+                        <label>Title<input value={editDraft.title} onChange={(event) => setEditDraft((draft) => ({ ...draft, title: event.target.value }))} /></label>
+                        <label>Content<textarea rows={6} value={editDraft.text} onChange={(event) => setEditDraft((draft) => ({ ...draft, text: event.target.value }))} /></label>
+                        <label>Publication date<input value={editDraft.published_date} onChange={(event) => setEditDraft((draft) => ({ ...draft, published_date: event.target.value }))} /></label>
+                        <label>Official source URL<input value={editDraft.source_url} onChange={(event) => setEditDraft((draft) => ({ ...draft, source_url: event.target.value }))} /></label>
+                        <div className="row"><button type="button" disabled={busyId === notice.id} onClick={() => void saveRevision(notice)}>{busyId === notice.id ? 'Saving…' : 'Save new version'}</button><button type="button" className="btn-secondary" onClick={() => setEditingId(null)}>Cancel</button></div>
+                      </div>
+                    ) : <button type="button" className="btn-secondary" onClick={() => beginEdit(notice)}>Edit content</button>}
                     <details><summary>Redacted notice text</summary><pre className="pre">{notice.redacted_text || 'No extracted text is stored.'}</pre></details>
                     {notice.admin_review_note && <div className="muted">Review note: {notice.admin_review_note}</div>}
                   </td>

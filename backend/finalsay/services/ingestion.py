@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from finalsay.adapters.base import RawNotice
 from finalsay.models import Institution, Notice, NoticeField, ScrapeProgress, ScrapeRun
 from finalsay.services import extraction
+from finalsay.services import alerts
 from finalsay.services.extraction import ExtractionResult
 from finalsay.services.notice_dates import parse_publication_date
 from finalsay.services.provenance import sha256_notice
@@ -207,6 +208,13 @@ def upsert_official(
         incoming_source_hash = str(incoming_source_hash).strip().lower()
         if not re.fullmatch(r"[a-f0-9]{64}", incoming_source_hash):
             incoming_source_hash = None
+    incoming_title = raw.metadata.get("title") or _extract_title(raw.text)
+    if incoming_title:
+        incoming_title = extraction.normalize_unicode_text(str(incoming_title))[:500]
+
+    def normalized_title(value: str | None) -> str:
+        return re.sub(r"[^\w]+", "", (value or "").casefold())
+
     current = None
     if source_key:
         current = db.scalar(
@@ -242,7 +250,11 @@ def upsert_official(
             if published_date:
                 _set_publication_date(current, published_date)
             return current, "unchanged"
-        if current.sha256 == digest and not changed_source_file:
+        if (
+            current.sha256 == digest
+            and not changed_source_file
+            and normalized_title(current.title) == normalized_title(incoming_title)
+        ):
             # Existing rows predate the raw-file fingerprint. Establish a
             # baseline without manufacturing a version on the first poll.
             if incoming_source_hash and not current_source_hash:
@@ -299,11 +311,7 @@ def upsert_official(
         version_no = current.version_no + 1
         outcome = "modified"
 
-    title = raw.metadata.get("title")
-    if not title:
-        title = _extract_title(raw.text)
-    if title:
-        title = extraction.normalize_unicode_text(str(title))[:500]
+    title = incoming_title
     published_date = raw.metadata.get("source_date")
     normalized_published_date = (
         extraction.normalize_unicode_text(str(published_date))[:80]
@@ -332,6 +340,10 @@ def upsert_official(
     _apply_extraction(notice, result)
     _store_fields(db, notice, result)
     db.flush()
+    if current is not None:
+        alerts.notify_updated_notice(db, current, notice)
+    else:
+        alerts.notify_created_notice(db, notice)
     return notice, outcome
 
 
@@ -367,6 +379,7 @@ def _apply_source_snapshot(db: Session, institution: Institution, adapter) -> in
         elif notice.source_state != "removed":
             notice.source_state = "removed"
             notice.source_removed_at = now
+            alerts.notify_source_removed(db, notice)
             removed += 1
     return removed
 
@@ -603,11 +616,31 @@ def create_submission(
 ) -> Notice:
     """Extract a student submission and persist it as a ``submission`` notice."""
     result = extraction.extract(text=text, pdf_bytes=pdf_bytes, image_bytes=image_bytes)
+    title = _extract_title(result.redacted_text)
+    normalized_text = result.redacted_text or ""
+    has_uploaded_file = pdf_bytes is not None or image_bytes is not None
+    looks_like_typed_claim = bool(
+        not title
+        and len(normalized_text) <= 900
+        and not re.search(
+            r"\b(?:notice|notification|circular|ref(?:erence)?\s*(?:no|number)|"
+            r"issued by|university|registrar|subject:)\b",
+            normalized_text,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(?:deadline|due|payment|fee|exam|hostel|application|scholarship|"
+            r"admission|class|registration|rumou?r|heard|says|said)\b",
+            normalized_text,
+            re.IGNORECASE,
+        )
+    )
     notice = Notice(
         kind="submission",
         institution_id=institution_id,
         submitted_by=submitted_by,
-        title=_extract_title(result.redacted_text),
+        title=title,
+        submission_mode="document" if has_uploaded_file or not looks_like_typed_claim else "claim",
         extraction_quality="student_submitted",
         retrieved_at=datetime.now(timezone.utc),
     )
@@ -625,13 +658,52 @@ def publish_official(
     text: str,
     institution: Institution,
     source_url: str | None = None,
+    source_key: str | None = None,
+    title: str | None = None,
+    published_date: str | None = None,
 ) -> Notice:
     """Publish an issuer-provided official notice (extraction + content hash)."""
     raw = RawNotice(
         text=text,
-        source_url=source_url,
+        source_url=source_url or "",
         institution_slug=institution.slug,
-        metadata={"extraction_quality": "issuer_submitted"},
+        external_id=source_key,
+        metadata={
+            "extraction_quality": "issuer_submitted",
+            "title": title,
+            "source_date": published_date,
+        },
     )
     notice, _created = upsert_official(db, raw, institution)
     return notice
+
+
+def revise_official(
+    db: Session,
+    *,
+    notice: Notice,
+    text: str,
+    title: str | None = None,
+    source_url: str | None = None,
+    published_date: str | None = None,
+) -> Notice:
+    """Create a new current version of an admin-managed official notice."""
+    if notice.kind != "official" or not notice.is_current or notice.institution is None:
+        raise ValueError("only a current official notice can be revised")
+    stable_key = (
+        notice.source_key
+        or notice.source_url
+        or f"admin-record:{notice.institution_id}:{notice.id}"
+    )
+    if notice.source_key is None:
+        notice.source_key = stable_key
+        db.flush()
+    return publish_official(
+        db,
+        text=text,
+        institution=notice.institution,
+        source_url=source_url if source_url is not None else notice.source_url,
+        source_key=stable_key,
+        title=title if title is not None else notice.title,
+        published_date=published_date if published_date is not None else notice.published_date,
+    )

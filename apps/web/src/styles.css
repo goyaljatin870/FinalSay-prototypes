@@ -782,6 +782,96 @@ td button {
   font-size: 11px;
 }
 
+.nav-alert-count {
+  display: inline-grid;
+  min-width: 19px;
+  height: 19px;
+  margin-left: 7px;
+  padding: 0 5px;
+  place-items: center;
+  color: var(--accent-ink);
+  background: #8d6455;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.alert-card {
+  padding: 20px 22px;
+}
+
+.alert-card h2 {
+  font-size: 19px;
+}
+
+.alert-unread {
+  border-color: #cfc4ad;
+  box-shadow: inset 3px 0 #8d795e, var(--shadow-card);
+}
+
+.alert-change {
+  padding: 10px 12px;
+  background: var(--panel-soft);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+
+.alert-follow-row {
+  justify-content: space-between;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.alert-follow-row:last-child {
+  border-bottom: 0;
+}
+
+.alerts-page .grow {
+  flex: 1 1 260px;
+}
+
+.alerts-page .row > label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.admin-create-notice {
+  margin: 18px 0;
+  padding: 16px 18px;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.admin-create-notice summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.admin-create-notice form {
+  margin-top: 16px;
+}
+
+.admin-create-notice textarea,
+.admin-notice-editor textarea {
+  width: 100%;
+}
+
+.admin-notice-editor {
+  max-width: 620px;
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--panel-soft);
+  border-radius: var(--radius-md);
+}
+
+.alert-pagination {
+  justify-content: space-between;
+  padding-top: 12px;
+}
+
 .notice-filters {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) minmax(200px, 280px) auto;

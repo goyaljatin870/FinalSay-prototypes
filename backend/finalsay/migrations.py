@@ -22,6 +22,7 @@ _COLUMNS: dict[str, dict[str, str]] = {
         "institution_id": "INTEGER REFERENCES institution(id)",
     },
     "notice": {
+        "submission_mode": "VARCHAR(20) NOT NULL DEFAULT 'legacy'",
         "title": "VARCHAR(500)",
         "published_date": "VARCHAR(80)",
         "published_on": "DATE",

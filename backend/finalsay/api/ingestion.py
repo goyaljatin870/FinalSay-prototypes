@@ -232,6 +232,8 @@ async def submit(
         candidate_text=outcome.candidate.redacted_text if outcome.candidate else None,
         candidate_supplemental_extractions=candidate_extractions,
         evidence=outcome.evidence,
+        student_summary=outcome.student_summary,
+        student_verdict=outcome.student_verdict,
     )
 
 
@@ -299,6 +301,18 @@ def get_submission_result(
         candidate_text=candidate.redacted_text if candidate else None,
         candidate_supplemental_extractions=extractions,
         evidence=[],
+        student_summary=(
+            edge.rationale
+            if (edge.rationale or "").startswith((
+                "The official notice lists ",
+                "A related official notice was found, but FinalSay could not verify",
+                "A related official portal listing was found",
+            ))
+            else None
+        ),
+        student_verdict=comparison.student_verdict_for(
+            submission, candidate, edge.label, edge.rationale
+        ),
     )
 
 

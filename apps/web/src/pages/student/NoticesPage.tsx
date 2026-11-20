@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../auth/AuthContext'
 import { api, errorMessage } from '../../api/client'
 import type { NoticeDetail, StudentNoticeFeed, StudentNoticeItem } from '../../api/types'
+import { useNoticeFollows } from '../../hooks/useNoticeFollows'
 
 const PAGE_SIZE = 20
 
@@ -38,6 +39,8 @@ export default function NoticesPage() {
   const [detailErrorId, setDetailErrorId] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
+  const { noticeIds, busyIds, toggle: toggleFollow } = useNoticeFollows(user?.role === 'student')
+  const [followError, setFollowError] = useState('')
 
   useEffect(() => {
     let current = true
@@ -112,6 +115,11 @@ export default function NoticesPage() {
       setDetailLoadingId(null)
     }
   }
+
+  useEffect(() => {
+    const noticeId = Number(searchParams.get('notice'))
+    if (Number.isInteger(noticeId) && noticeId > 0) void openDetail(noticeId)
+  }, [searchParams])
 
   const goToPage = (targetPage: number) => {
     const next = new URLSearchParams(searchParams)
@@ -243,6 +251,17 @@ export default function NoticesPage() {
                     {notice.preview && <p>{notice.preview}</p>}
                     <div className="notice-item-footer">
                       <span className="notice-source-label">Official source</span>
+                      {user?.role === 'student' && <button
+                        type="button"
+                        className="btn-secondary"
+                        disabled={busyIds.has(notice.id)}
+                        onClick={() => {
+                          setFollowError('')
+                          void toggleFollow(notice.id).catch((err) => setFollowError(errorMessage(err)))
+                        }}
+                      >
+                        {busyIds.has(notice.id) ? 'Saving…' : noticeIds.has(notice.id) ? 'Following' : 'Follow notice'}
+                      </button>}
                       <button
                         type="button"
                         className="btn-secondary"
@@ -275,6 +294,17 @@ export default function NoticesPage() {
                           <p className="eyebrow">Official source detail</p>
                           <h2>{selected.title || `Notice #${selected.id}`}</h2>
                         </div>
+                        {user?.role === 'student' && <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={busyIds.has(selected.id)}
+                          onClick={() => {
+                            setFollowError('')
+                            void toggleFollow(selected.id).catch((err) => setFollowError(errorMessage(err)))
+                          }}
+                        >
+                          {busyIds.has(selected.id) ? 'Saving…' : noticeIds.has(selected.id) ? 'Following' : 'Follow notice'}
+                        </button>}
                       </div>
                       <dl className="kv">
                         <dt>Issuer</dt><dd>{selected.issuer ?? '—'}</dd>
@@ -345,6 +375,7 @@ export default function NoticesPage() {
           </div>
         )}
         {error && <p className="error">{error}</p>}
+        {followError && <p className="error" role="alert">{followError}</p>}
       </section>
 
     </div>

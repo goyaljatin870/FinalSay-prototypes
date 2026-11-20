@@ -146,6 +146,278 @@ def test_ocr_course_heading_retrieves_exact_du_listing_over_semantic_decoy(db_se
     assert ranked[1].notice.id == decoy.id
 
 
+def _thapar_hostel_notice(db, title: str, body: str, published: str):
+    notice = _make_notice(db, "official", body, institution_id=1)
+    notice.title = title
+    notice.published_date = published
+    notice.extraction_quality = "extracted"
+    return notice
+
+
+def test_typed_hostel_claim_uses_relevant_retention_notice_not_semantic_decoy(db_session):
+    relevant = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        """Date: 12 Nov 2026
+NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27
+UG / TSLAS 3rd Year
+15 Nov to 25 Nov, 2026
+21 Dec, 2026 to 2 Jan, 2027
+""",
+        "12 November 2026",
+    )
+    decoy = _thapar_hostel_notice(
+        db_session,
+        "Hostel Allotment for Odd Semester 2026–27",
+        "Hostel allotment fee payment and room booking for UG 3rd Year students.",
+        "03 March 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "hostel fee payment deadline for ug 3rd year girls is 30 november",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    class _SemanticDecoyFirst(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(decoy, 0.377, 0.593), (relevant, 0.320, 0.534)]
+
+        def classify(self, _premise, _hypothesis):
+            raise AssertionError("typed date claim should use schedule evidence")
+
+    outcome = comparison.classify_submission(
+        db_session, submission, model=_SemanticDecoyFirst(), threshold=0.6
+    )
+    db_session.commit()
+
+    assert outcome.candidate is not None
+    assert outcome.candidate.id == relevant.id
+    assert outcome.edge.dst_notice_id == relevant.id
+    assert outcome.label == "contradictory"
+    assert outcome.student_verdict == "CONTRADICTED"
+    assert outcome.confidence == 0.0
+    assert outcome.edge.model == "claim-schedule-evidence"
+    assert outcome.student_summary == (
+        "The official notice lists 15 November 2026 to 25 November 2026 for "
+        "UG / TSLAS 3rd Year; 30 November 2026 is outside that window, "
+        "which ends on 25 November 2026. "
+        "The notice does not specify a girls-only rule."
+    )
+    assert "03 March 2026" not in outcome.student_summary
+    assert "publication date" in " ".join(outcome.evidence).lower()
+
+
+def test_typed_deadline_claim_compares_schedule_not_publication_date(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        """Date: 12 Nov 2026
+NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27
+UG / TSLAS 3rd Year
+15 Nov to 25 Nov, 2026
+""",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "UG 3rd year hostel fee payment deadline is 25 November 2026",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    class _Ranker(MockComparisonModel):
+        def rank_candidates(self, _submission, officials):
+            return [(officials[0], 0.8, 0.7)]
+
+    outcome = comparison.classify_submission(db_session, submission, model=_Ranker())
+    assert outcome.candidate.id == official.id
+    assert outcome.label == "consistent"
+    assert outcome.student_verdict == "CONFIRMED"
+    assert "25 November 2026 is the last date" in (outcome.student_summary or "")
+    assert "12 November 2026" not in (outcome.student_summary or "")
+
+
+def test_explicit_claim_year_is_not_silently_replaced_by_notice_year(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2026",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "UG 3rd year hostel fee payment deadline is 25 November 2027",
+        institution_id=1,
+    )
+    assert comparison._claim_schedule_check(submission, official)[0] == "contradictory"
+    assert "year does not match" in comparison._claim_schedule_check(submission, official)[1].lower()
+
+
+def test_typed_deadline_claim_does_not_apply_schedule_from_wrong_semester_or_year(db_session):
+    wrong = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (ODD Sem 2025-26)",
+        "NOTICE – Hostel Retention & Fee Payment for ODD Semester 2025–26\n"
+        "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2025",
+        "12 November 2025",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "EVEN semester 2026-27 UG 3rd year hostel fee payment deadline is 30 November",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    assert comparison._claim_schedule_check(submission, wrong) == (None, None)
+
+
+def test_claim_for_uncovered_student_category_is_not_given_a_deadline_verdict(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 4th Year\n20 Nov to 30 Nov, 2026",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "UG 3rd year hostel fee payment deadline is 30 November 2026",
+        institution_id=1,
+    )
+    assert comparison._claim_schedule_check(submission, official) == (None, None)
+
+
+def test_deadline_claim_uses_end_of_category_window_not_any_date_inside_it(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 4th Year\n20 Nov to 30 Nov, 2026",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "UG 4th year hostel retention deadline is 25 November 2026",
+        institution_id=1,
+    )
+    assert comparison._claim_schedule_check(submission, official)[0] == "contradictory"
+
+
+def test_gender_specific_claim_is_only_partially_supported_when_notice_omits_gender(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2026",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "hostel retention deadline for UG 3rd year girls is 25 November",
+        institution_id=1,
+    )
+    db_session.commit()
+    outcome = comparison.classify_submission(db_session, submission, model=MockComparisonModel())
+    assert outcome.label == "consistent"
+    assert outcome.student_verdict == "PARTIALLY_SUPPORTED"
+    assert "does not specify a girls-only rule" in (outcome.student_summary or "")
+
+
+def test_unsupported_extension_rumour_is_not_asserted_as_false_or_confirmed(db_session):
+    official = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2026",
+        "12 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "hostel fees have been extended till 5 December",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    class _NoModelGuess(MockComparisonModel):
+        def rank_candidates(self, _submission, officials):
+            return [(official, 0.7, 0.7)]
+
+        def classify(self, _premise, _hypothesis):
+            raise AssertionError("typed claims without direct evidence must not be guessed by NLI")
+
+    outcome = comparison.classify_submission(db_session, submission, model=_NoModelGuess())
+    assert outcome.label == "unresolved"
+    assert outcome.student_verdict == "NEEDS_MANUAL_VERIFICATION"
+    assert "No conclusion was made" in (outcome.student_summary or "")
+
+
+def test_later_fee_extension_beats_original_schedule_and_supports_new_date(db_session):
+    original = _thapar_hostel_notice(
+        db_session,
+        "Hostel Retention Notice (EVEN Sem 2026-27)",
+        "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2026",
+        "12 November 2026",
+    )
+    extension = _thapar_hostel_notice(
+        db_session,
+        "Extension of Hostel Retention Fee Payment (EVEN Sem 2026-27)",
+        "NOTICE – Extension of Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+        "UG / TSLAS 3rd Year\nLast date for payment extended to 30 November 2026",
+        "20 November 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "hostel fee payment deadline for UG 3rd year is 30 November",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    class _OriginalRanksFirst(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(original, 0.4, 0.65), (extension, 0.3, 0.58)]
+
+    outcome = comparison.classify_submission(db_session, submission, model=_OriginalRanksFirst())
+    assert outcome.candidate.id == extension.id
+    assert outcome.label == "consistent"
+    assert outcome.student_verdict == "CONFIRMED"
+    assert "30 November 2026 is the last date" in (outcome.student_summary or "")
+
+
+def test_unrelated_hostel_allotment_notice_is_not_a_deadline_candidate(db_session):
+    decoy = _thapar_hostel_notice(
+        db_session,
+        "Hostel Allotment for Odd Semester 2026-27",
+        "Hostel allotment fee payment and room booking for UG 3rd Year.\n"
+        "Room booking period is 27 May to 6 June 2026.",
+        "03 March 2026",
+    )
+    submission = _make_notice(
+        db_session,
+        "submission",
+        "hostel fee payment deadline for UG 3rd year is 30 November",
+        institution_id=1,
+    )
+    db_session.commit()
+
+    class _OnlyAllotment(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(decoy, 0.9, 0.9)]
+
+    assert comparison.retrieve_candidates(db_session, submission, model=_OnlyAllotment()) == []
+
+
 def test_high_confidence_persists_edge_without_review_case(db_session):
     official = _make_notice(
         db_session,
@@ -159,6 +431,7 @@ def test_high_confidence_persists_edge_without_review_case(db_session):
         "The exam is postponed to 22 Sept for all students.",
         action="exam postponed to 22 Sept",
     )
+    submission.title = "Examination schedule notice"
     db_session.commit()
 
     outcome = comparison.classify_submission(db_session, submission, threshold=0.6)

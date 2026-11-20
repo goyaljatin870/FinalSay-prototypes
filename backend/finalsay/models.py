@@ -134,6 +134,9 @@ class Notice(Base):
         ForeignKey("user.id"), nullable=True
     )
     kind: Mapped[str] = mapped_column(String(20), nullable=False)  # official | submission
+    submission_mode: Mapped[str] = mapped_column(
+        String(20), default="legacy", server_default=text("'legacy'"), nullable=False
+    )  # claim | document | legacy
     title: Mapped[str | None] = mapped_column(String(500))
     published_date: Mapped[str | None] = mapped_column(String(80))
     published_on: Mapped[date | None] = mapped_column(Date)
@@ -195,6 +198,69 @@ class Notice(Base):
             sqlite_where=text("kind = 'official' AND is_current = TRUE AND source_key IS NOT NULL"),
             postgresql_where=text("kind = 'official' AND is_current IS TRUE AND source_key IS NOT NULL"),
         ),
+    )
+
+
+class NoticeFollow(Base):
+    """A student's durable subscription to a specific official notice."""
+
+    __tablename__ = "notice_follow"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), nullable=False)
+    notice_id: Mapped[int] = mapped_column(ForeignKey("notice.id", ondelete="CASCADE"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+    user: Mapped["User"] = relationship()
+    notice: Mapped["Notice"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "notice_id", name="uq_notice_follow_user_notice"),
+        Index("ix_notice_follow_notice", "notice_id"),
+    )
+
+
+class CategoryFollow(Base):
+    """A student's topic/department phrase subscription within one institution."""
+
+    __tablename__ = "category_follow"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), nullable=False)
+    institution_id: Mapped[int] = mapped_column(ForeignKey("institution.id", ondelete="CASCADE"), nullable=False)
+    category_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    category_label: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "institution_id", "category_key", name="uq_category_follow_user_institution_key"),
+        Index("ix_category_follow_institution", "institution_id"),
+    )
+
+
+class StudentNotification(Base):
+    """Persistent in-app alert delivered to one student."""
+
+    __tablename__ = "student_notification"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), nullable=False)
+    notice_id: Mapped[int | None] = mapped_column(ForeignKey("notice.id", ondelete="SET NULL"))
+    previous_notice_id: Mapped[int | None] = mapped_column(ForeignKey("notice.id", ondelete="SET NULL"))
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    old_value: Mapped[str | None] = mapped_column(Text)
+    new_value: Mapped[str | None] = mapped_column(Text)
+    dedupe_key: Mapped[str] = mapped_column(String(240), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "dedupe_key", name="uq_student_notification_user_dedupe"),
+        Index("ix_student_notification_inbox", "user_id", "dismissed_at", "created_at"),
+        Index("ix_student_notification_unread", "user_id", "read_at"),
     )
 
 

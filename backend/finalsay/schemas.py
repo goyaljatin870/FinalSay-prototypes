@@ -118,6 +118,11 @@ class ComparisonResponse(BaseModel):
     candidate_text: str | None = None
     candidate_supplemental_extractions: list["NoticeDocumentExtractionOut"] = []
     evidence: list[str] = []
+    student_summary: str | None = None
+    student_verdict: Literal[
+        "CONFIRMED", "CONTRADICTED", "PARTIALLY_SUPPORTED",
+        "NOT_FOUND", "NEEDS_MANUAL_VERIFICATION",
+    ] = "NEEDS_MANUAL_VERIFICATION"
 
 
 # --- Notices ---
@@ -158,6 +163,7 @@ class NoticeSummary(BaseModel):
 
 
 class NoticeDetail(NoticeSummary):
+    submission_mode: Literal["claim", "document", "legacy"] = "legacy"
     action: str | None = None
     redacted_text: str | None = None
     fields: list[NoticeFieldOut] = []
@@ -171,6 +177,54 @@ class StudentNoticeItem(NoticeSummary):
 class NoticeMonthCount(BaseModel):
     month: str
     count: int
+
+
+class FollowedNoticeOut(BaseModel):
+    notice: NoticeSummary
+    followed_at: datetime
+
+
+class CategoryFollowOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    institution_id: int
+    category_key: str
+    category_label: str
+    created_at: datetime
+
+
+class CategoryFollowCreate(BaseModel):
+    category_label: str = Field(min_length=2, max_length=120)
+
+
+class StudentNotificationOut(BaseModel):
+    id: int
+    kind: str
+    title: str
+    message: str
+    notice_id: int | None = None
+    previous_notice_id: int | None = None
+    notice_title: str | None = None
+    previous_notice_title: str | None = None
+    source_url: str | None = None
+    created_at: datetime
+    read_at: datetime | None = None
+    old_value: str | None = None
+    new_value: str | None = None
+
+
+class StudentNotificationPage(BaseModel):
+    items: list[StudentNotificationOut]
+    total: int
+    unread_count: int
+    page: int
+    page_size: int
+
+
+class StudentFollowsOut(BaseModel):
+    notices: list[FollowedNoticeOut]
+    categories: list[CategoryFollowOut]
 
 
 class StudentNoticeFeed(BaseModel):
@@ -237,6 +291,21 @@ class AdminNoticePage(BaseModel):
 class AdminNoticeReviewUpdate(BaseModel):
     status: Literal["active", "flagged", "archived", "rejected"]
     note: str | None = Field(default=None, max_length=1_000)
+
+
+class AdminOfficialNoticeWrite(BaseModel):
+    institution_id: int = Field(ge=1)
+    title: str = Field(min_length=3, max_length=500)
+    text: str = Field(min_length=1, max_length=100_000)
+    source_url: str | None = Field(default=None, max_length=500)
+    published_date: str | None = Field(default=None, max_length=80)
+
+
+class AdminOfficialNoticeRevision(BaseModel):
+    title: str | None = Field(default=None, min_length=3, max_length=500)
+    text: str = Field(min_length=1, max_length=100_000)
+    source_url: str | None = Field(default=None, max_length=500)
+    published_date: str | None = Field(default=None, max_length=80)
 
 
 class InstitutionCreate(BaseModel):

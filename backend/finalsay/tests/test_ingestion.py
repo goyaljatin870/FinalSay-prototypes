@@ -712,6 +712,83 @@ def test_submit_paste_returns_classified_result(client: TestClient, make_user, d
     assert "cancel" in body["rationale"].lower() or body["label"] == "unresolved"
 
 
+def test_typed_schedule_claim_api_returns_same_evidence_notice_as_persisted_result(
+    client: TestClient, make_user, db_session, monkeypatch
+):
+    from finalsay.models_iface.comparison_model import MockComparisonModel
+
+    institution = Institution(
+        name="Thapar Test University", slug="thapar-claim-test",
+        scrape_type="thapar_html", active=True,
+    )
+    db_session.add(institution)
+    db_session.flush()
+    relevant = Notice(
+        kind="official", institution_id=institution.id,
+        title="Hostel Retention Notice (EVEN Sem 2026-27)",
+        published_date="12 November 2026",
+        extraction_quality="extracted",
+        redacted_text=(
+            "Date: 12 Nov 2026\n"
+            "NOTICE – Hostel Retention & Fee Payment for EVEN Semester 2026–27\n"
+            "UG / TSLAS 3rd Year\n15 Nov to 25 Nov, 2026\n"
+        ),
+        source_url="https://example.test/retention.pdf",
+    )
+    decoy = Notice(
+        kind="official", institution_id=institution.id,
+        title="Hostel Allotment for Odd Semester 2026-27",
+        published_date="03 March 2026", extraction_quality="extracted",
+        redacted_text="Hostel allotment fee payment and room booking for UG 3rd Year.",
+    )
+    db_session.add_all([relevant, decoy])
+    db_session.commit()
+
+    class _SemanticDecoyFirst(MockComparisonModel):
+        def rank_candidates(self, _submission, _officials):
+            return [(decoy, 0.377, 0.593), (relevant, 0.320, 0.534)]
+
+        def classify(self, _premise, _hypothesis):
+            raise AssertionError("typed deadline claims should use schedule evidence")
+
+    monkeypatch.setattr(comparison, "get_comparison_model", lambda: _SemanticDecoyFirst())
+    token = _token(client, make_user, "thapar-claim@example.com", "s3cret1", "student")
+    assigned = client.patch(
+        "/api/auth/me/institution", json={"institution_id": institution.id},
+        headers=_auth(token),
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    response = client.post(
+        "/api/ingest/submit",
+        data={"text": "hostel fee payment deadline for ug 3rd year girls is 30 november"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["candidate_id"] == relevant.id
+    assert body["label"] == "contradictory"
+    assert body["student_verdict"] == "CONTRADICTED"
+    assert "30 November 2026 is outside" in body["student_summary"]
+    assert db_session.get(Notice, body["submission_id"]).submission_mode == "claim"
+
+    persisted = client.get(
+        f"/api/ingest/submissions/{body['submission_id']}/result", headers=_auth(token)
+    )
+    assert persisted.status_code == 200, persisted.text
+    assert persisted.json()["candidate_id"] == body["candidate_id"]
+    assert persisted.json()["student_summary"] == body["student_summary"]
+    assert persisted.json()["student_verdict"] == body["student_verdict"]
+
+    rechecked = client.post(
+        f"/api/compare/{body['submission_id']}", headers=_auth(token)
+    )
+    assert rechecked.status_code == 200, rechecked.text
+    assert rechecked.json()["candidate_id"] == body["candidate_id"]
+    assert rechecked.json()["student_summary"] == body["student_summary"]
+    assert rechecked.json()["student_verdict"] == body["student_verdict"]
+
+
 def test_submit_without_input_is_422(client: TestClient, make_user):
     student = _token(client, make_user, "stud4@example.com", "s3cret1", "student")
     resp = client.post("/api/ingest/submit", data={}, headers=_auth(student))
@@ -887,6 +964,7 @@ def test_real_thapar_pdf_upload_is_compared_and_persisted(
         "real-thapar-upload@example.com", "s3cret1", "student"
     ).id
     assert saved.institution_id == institution.id
+    assert saved.submission_mode == "document"
     assert len(saved.redacted_text or "") > 500
     assert db_session.scalar(
         select(RelationEdge).where(RelationEdge.src_notice_id == saved.id)

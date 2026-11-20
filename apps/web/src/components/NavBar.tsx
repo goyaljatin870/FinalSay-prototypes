@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, NavLink, useNavigate } from 'react-router-dom'
+import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
 import { api, errorMessage } from '../api/client'
 import type { InstitutionChoice } from '../api/types'
@@ -27,9 +27,11 @@ const NAV: NavItem[] = [
 export default function NavBar() {
   const { user, logout, updateInstitution } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
   const [institutions, setInstitutions] = useState<InstitutionChoice[]>([])
   const [campusBusy, setCampusBusy] = useState(false)
   const [campusError, setCampusError] = useState('')
+  const [unreadAlerts, setUnreadAlerts] = useState(0)
 
   useEffect(() => {
     if (user?.role !== 'student') {
@@ -41,6 +43,21 @@ export default function NavBar() {
       .then((res) => setInstitutions(res.data))
       .catch(() => setInstitutions([]))
   }, [user?.role])
+
+  useEffect(() => {
+    if (user?.role !== 'student') {
+      setUnreadAlerts(0)
+      return
+    }
+    const refreshUnread = () => {
+      api.get<{ unread_count: number }>('/alerts/unread-count')
+        .then((res) => setUnreadAlerts(res.data.unread_count))
+        .catch(() => setUnreadAlerts(0))
+    }
+    refreshUnread()
+    window.addEventListener('finalsay-alerts-updated', refreshUnread)
+    return () => window.removeEventListener('finalsay-alerts-updated', refreshUnread)
+  }, [location.pathname, user?.id, user?.role])
 
   const onInstitutionChange = async (institutionId: number) => {
     if (!institutionId || institutionId === user?.institution_id || campusBusy) return
@@ -73,7 +90,7 @@ export default function NavBar() {
           {user &&
             NAV.filter((item) => item.roles.includes(user.role)).map((item) => (
               <NavLink key={item.to} to={item.to} className="nav-link">
-                {item.label}
+                {item.label}{item.to === '/alerts' && unreadAlerts > 0 && <span className="nav-alert-count" aria-label={`${unreadAlerts} unread alerts`}>{unreadAlerts > 99 ? '99+' : unreadAlerts}</span>}
               </NavLink>
             ))}
         </nav>
