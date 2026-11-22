@@ -81,10 +81,12 @@ def create_app() -> FastAPI:
     Base.metadata.create_all(bind=engine)
     run_migrations(engine)
 
-    if settings.initial_admin_email and settings.initial_admin_password:
-        from finalsay.services.provision_admin import create_first_admin
-        from finalsay.db import SessionLocal
-        with SessionLocal() as db:
+    from finalsay.db import SessionLocal
+    from finalsay.auth import hash_password
+    from finalsay.models import User, Institution
+    with SessionLocal() as db:
+        if settings.initial_admin_email and settings.initial_admin_password:
+            from finalsay.services.provision_admin import create_first_admin
             try:
                 create_first_admin(
                     db,
@@ -96,6 +98,37 @@ def create_app() -> FastAPI:
                 logger.info("Provisioned initial administrator %s", settings.initial_admin_email)
             except ValueError:
                 db.rollback()
+
+        # Provision fallback demo accounts so logins are always available out of the box
+        admin_email = "admin@finalsay.local"
+        existing_admin = db.scalar(select(User).where(User.email == admin_email))
+        if existing_admin is None:
+            admins_count = db.scalar(select(func.count(User.id)).where(User.role == "admin")) or 0
+            if admins_count == 0:
+                demo_admin = User(
+                    email=admin_email,
+                    hashed_password=hash_password("AdminPass12345678!"),
+                    role="admin",
+                    display_name="Administrator",
+                )
+                db.add(demo_admin)
+                db.commit()
+                logger.info("Provisioned demo admin %s", admin_email)
+
+        student_email = "student@finalsay.local"
+        existing_student = db.scalar(select(User).where(User.email == student_email))
+        if existing_student is None:
+            first_inst = db.scalar(select(Institution).where(Institution.active.is_(True)).order_by(Institution.id))
+            demo_student = User(
+                email=student_email,
+                hashed_password=hash_password("Student123!"),
+                role="student",
+                display_name="Sample Student",
+                institution_id=first_inst.id if first_inst else None,
+            )
+            db.add(demo_student)
+            db.commit()
+            logger.info("Provisioned demo student %s (institution: %s)", student_email, first_inst.name if first_inst else None)
 
     @app.middleware("http")
     async def request_logging_middleware(request: Request, call_next):

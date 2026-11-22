@@ -44,6 +44,12 @@ export function errorMessage(err: unknown): string {
     if (status === 409) {
       return 'Conflict: That resource or email already exists, or an operation is in progress.'
     }
+    if (status === 502 || status === 504) {
+      return 'The server took too long to respond. Please try again.'
+    }
+    if (status === 503) {
+      return detail || 'The server is temporarily busy. Please wait a moment and try again.'
+    }
     if (err.code === 'ERR_NETWORK' || !err.response) {
       return 'Cannot reach FinalSay. Check that the app is running and try again.'
     }

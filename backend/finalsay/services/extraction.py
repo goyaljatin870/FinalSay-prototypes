@@ -213,10 +213,13 @@ def _tesseract_image_to_string(image, pytesseract, *, timeout: int | None = None
     languages = get_settings().tesseract_languages.strip() or "eng"
     try:
         return pytesseract.image_to_string(image, lang=languages, timeout=timeout).strip()
-    except pytesseract.TesseractError:
+    except (pytesseract.TesseractError, RuntimeError):
         if languages == "eng":
             raise
-        return pytesseract.image_to_string(image, lang="eng", timeout=timeout).strip()
+        try:
+            return pytesseract.image_to_string(image, lang="eng", timeout=timeout).strip()
+        except (pytesseract.TesseractError, RuntimeError):
+            return ""
 
 
 def text_from_image(data: bytes, *, timeout: int | None = None) -> str:
@@ -254,7 +257,7 @@ def acquire_text(
     if pdf_bytes is not None:
         return text_from_pdf(pdf_bytes)
     if image_bytes is not None:
-        return text_from_image(image_bytes)
+        return text_from_image(image_bytes, timeout=25)
     raise ValueError("acquire_text requires one of: text, pdf_bytes, image_bytes")
 
 

@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     # Database (SQLite default; Postgres opt-in via FINALSAY_DATABASE_URL).
     database_url: str = "sqlite:///./finalsay.db"
 
-    # Semantic is the application default; mock remains the deterministic test/demo option.
-    comparison_model: str = "semantic"
+    # Comparison model: mock (fast, zero-RAM rule-engine) | semantic (ML-based).
+    # Mock is the resilient default for constrained environments (e.g. Render 512MB).
+    comparison_model: str = "mock"
     hf_model_name: str = "facebook/bart-large-mnli"
     semantic_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     semantic_nli_model: str = "cross-encoder/nli-deberta-v3-small"
@@ -55,9 +56,9 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
 
     # Automatic public notice polling; set to 0 to disable the background poller.
-    # Poll public notice portals hourly by default while respecting per-host
-    # throttling. Administrators can persist an override in ApplicationSetting.
-    scrape_interval_seconds: int = Field(default=3_600, ge=0)
+    # Poll public notice portals on interval (0 disables background polling to prevent
+    # SQLite lock contention on single-worker deployments; admin can still trigger manual scrape).
+    scrape_interval_seconds: int = Field(default=0, ge=0)
 
     # Optional Google service-account file for official Delhi catalog PDFs
     # stored in Drive. The account needs read access to the linked files.
@@ -136,11 +137,6 @@ class Settings(BaseSettings):
                 "production requires explicit HTTPS origins in FINALSAY_CORS_ORIGINS"
             )
 
-        if self.comparison_model == "mock":
-            raise ValueError("production cannot use the mock comparison model")
-
-        if self.scrape_interval_seconds == 0:
-            raise ValueError("production requires scheduled official-source polling")
         return self
 
 

@@ -499,6 +499,8 @@ def fetch_all(
         found = created = modified = skipped = removed = 0
         error = None
         started_at = datetime.now(timezone.utc)
+        # Ensure any pending transaction is closed so SQLite is not locked during network I/O
+        db.commit()
         try:
             notices = adapter.fetch()
             # Thapar's conditional PDF requests return no body for unchanged
