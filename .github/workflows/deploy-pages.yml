@@ -42,7 +42,6 @@ jobs:
         env:
           VITE_API_URL: https://finalsay-backend1.onrender.com/api
           VITE_BASE_URL: /FinalSay-prototypes/
-          VITE_BASE_URL: /FinalSay-prototype/
         run: npm run build
 
       - name: Upload Pages artifact
