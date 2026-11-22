@@ -80,6 +80,22 @@ def create_app() -> FastAPI:
     Base.metadata.create_all(bind=engine)
     run_migrations(engine)
 
+    if settings.initial_admin_email and settings.initial_admin_password:
+        from finalsay.services.provision_admin import create_first_admin
+        from finalsay.db import SessionLocal
+        with SessionLocal() as db:
+            try:
+                create_first_admin(
+                    db,
+                    settings.initial_admin_email,
+                    settings.initial_admin_password,
+                    display_name="Administrator",
+                )
+                db.commit()
+                logger.info("Provisioned initial administrator %s", settings.initial_admin_email)
+            except ValueError:
+                db.rollback()
+
     @app.middleware("http")
     async def request_logging_middleware(request: Request, call_next):
         start = time.perf_counter()

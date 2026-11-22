@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-insecure-finalsay-secret-change-me"
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 60 * 24
+    initial_admin_email: str | None = None
+    initial_admin_password: str | None = None
 
     # Comma-separated browser origins allowed to call the API ("*" allows all).
     cors_origins: str = "*"
