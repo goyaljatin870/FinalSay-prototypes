@@ -35,20 +35,14 @@ export function errorMessage(err: unknown): string {
   if (err instanceof AxiosError) {
     const detail = err.response?.data?.detail
     const status = err.response?.status
-    if (status === 409) {
-      return 'That email is already registered. Log in or use a different email.'
-    }
-    if (status === 503 || status === 502 || status === 504) {
-      return 'FinalSay is temporarily unavailable. Please try again shortly.'
-    }
-    if (status !== undefined && status >= 500) {
-      return 'FinalSay could not complete that request. Please try again shortly.'
-    }
-    if (typeof detail === 'string') return detail
+    if (typeof detail === 'string' && detail.trim().length > 0) return detail
     if (Array.isArray(detail) && detail.length > 0) {
       return `Please check your information: ${detail
         .map((d: { msg?: string }) => d.msg ?? 'invalid value')
         .join('; ')}`
+    }
+    if (status === 409) {
+      return 'Conflict: That resource or email already exists, or an operation is in progress.'
     }
     if (err.code === 'ERR_NETWORK' || !err.response) {
       return 'Cannot reach FinalSay. Check that the app is running and try again.'
