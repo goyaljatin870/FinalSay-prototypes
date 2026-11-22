@@ -23,7 +23,10 @@ from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_ope
 
 from finalsay.adapters.base import InstitutionAdapter, RawNotice
 
-USER_AGENT = "FinalSayNoticeVerifier/0.1 (+public academic notices; contact: local prototype)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 MAX_HTML_BYTES = 20_000_000
 MAX_JSON_BYTES = 3_000_000
 MAX_PDF_BYTES = 20_000_000
@@ -34,6 +37,7 @@ MAX_REQUEST_ATTEMPTS = 3
 MIN_REQUEST_INTERVAL = 0.5
 MAX_RESPONSE_SECONDS = 45
 RESPONSE_CHUNK_BYTES = 64 * 1024
+DEFAULT_REQUEST_TIMEOUT = 45
 DNS_LOOKUP_TIMEOUT_SECONDS = 5
 DNS_LOOKUP_ATTEMPTS = 3
 NITJ_HOSTS = {"nitj.ac.in", "www.nitj.ac.in", "v1.nitj.ac.in"}
@@ -98,7 +102,7 @@ def _read_bounded_response(response, max_bytes: int, *, clock=time.monotonic) ->
             # closed/invalid socket as already detached from network I/O.
             try:
                 if raw_socket.fileno() >= 0:
-                    raw_socket.settimeout(min(18.0, remaining))
+                    raw_socket.settimeout(min(45.0, remaining))
             except (OSError, ValueError):
                 pass
         chunk = response.read(min(RESPONSE_CHUNK_BYTES, max_bytes + 1 - total))
@@ -200,6 +204,7 @@ class PublicSiteClient:
         headers = {
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/json,application/pdf,*/*;q=0.5",
+            "Accept-Language": "en-US,en;q=0.9",
         }
         headers.update(request_headers or {})
         request = Request(
@@ -208,7 +213,7 @@ class PublicSiteClient:
             method="GET",
         )
         try:
-            response = self._opener.open(request, timeout=18)
+            response = self._opener.open(request, timeout=MAX_RESPONSE_SECONDS)
         except HTTPError as exc:
             return exc.code, exc.headers, exc.read(4096)
         except (URLError, TimeoutError, OSError) as exc:

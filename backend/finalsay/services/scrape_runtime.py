@@ -2,13 +2,34 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, local
+
+if sys.platform == "win32":
+    import msvcrt
+
+    class fcntl:  # minimal Windows stand-in for the two calls used below
+        LOCK_EX = 1
+        LOCK_NB = 2
+        LOCK_UN = 8
+
+        @staticmethod
+        def flock(fd, op):
+            os.lseek(fd, 0, 0)
+            if op & fcntl.LOCK_UN:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                return
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BlockingIOError from exc
+else:
+    import fcntl
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session

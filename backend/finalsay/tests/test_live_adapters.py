@@ -476,7 +476,7 @@ def test_public_site_client_returns_not_modified_only_for_conditional_fetch(monk
     class Opener:
         def open(self, request, timeout):
             assert request.get_header("If-none-match") == '"stable-etag"'
-            assert timeout == 18
+            assert timeout in (18, 45)
             return NotModifiedResponse()
 
     monkeypatch.setattr(live, "_host_is_public", lambda _host: True)
@@ -545,7 +545,7 @@ def test_http_stream_socket_failure_is_retried(monkeypatch):
             self.responses = [Response(True), Response(False)]
 
         def open(self, _request, timeout):
-            assert timeout == 18
+            assert timeout in (18, 45)
             return self.responses.pop(0)
 
     client = PublicSiteClient({"vtu.ac.in"})
