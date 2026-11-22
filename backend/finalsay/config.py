@@ -137,6 +137,12 @@ class Settings(BaseSettings):
                 "production requires explicit HTTPS origins in FINALSAY_CORS_ORIGINS"
             )
 
+        if self.comparison_model == "mock":
+            raise ValueError("production cannot use the mock comparison model")
+
+        if self.scrape_interval_seconds == 0:
+            raise ValueError("production requires scheduled official-source polling")
+
         return self
 
 
