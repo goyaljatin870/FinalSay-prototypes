@@ -112,11 +112,23 @@ def redact(text: str) -> str:
 
 def _tesseract_available() -> str | None:
     """Return a usable tesseract command path, or None if no engine is present."""
+    import os
+
     settings = get_settings()
     configured = settings.tesseract_cmd
     if configured and configured != "auto":
         return configured if shutil.which(configured) or _is_file(configured) else None
-    return shutil.which("tesseract")
+    which_cmd = shutil.which("tesseract")
+    if which_cmd:
+        return which_cmd
+    for candidate in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    ):
+        if _is_file(candidate):
+            return candidate
+    return None
 
 
 def _is_file(path: str) -> bool:
