@@ -61,6 +61,21 @@ def restore_if_needed() -> None:
         except Exception as exc:
             print(f"==> Warning: Could not restore seed database: {exc}")
 
+    # Ensure Thapar source records are consolidated and active
+    try:
+        if os.path.exists(target_path):
+            conn = sqlite3.connect(target_path)
+            cur = conn.cursor()
+            cur.execute("UPDATE user SET institution_id = 4 WHERE institution_id = 10")
+            cur.execute("UPDATE notice SET institution_id = 4 WHERE institution_id = 10")
+            cur.execute("UPDATE scrape_run SET institution_id = 4 WHERE institution_id = 10")
+            cur.execute("UPDATE institution SET active = 0, scrape_enabled = 0 WHERE id = 10")
+            cur.execute("UPDATE institution SET active = 1, scrape_enabled = 1 WHERE id = 4")
+            conn.commit()
+            conn.close()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     restore_if_needed()
