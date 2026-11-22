@@ -20,7 +20,18 @@ def _make_engine(database_url: str):
     if database_url.startswith("sqlite"):
         # Allow use across FastAPI's threadpool without per-thread checks.
         connect_args["check_same_thread"] = False
-    return create_engine(database_url, connect_args=connect_args, future=True)
+        connect_args["timeout"] = 30.0
+    eng = create_engine(database_url, connect_args=connect_args, future=True)
+    if database_url.startswith("sqlite"):
+        from sqlalchemy import event
+
+        @event.listens_for(eng, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
+    return eng
 
 
 settings = get_settings()
