@@ -32,6 +32,18 @@ def test_postponed_22_vs_15_sept_not_consistent():
     assert rationale
 
 
+def test_matching_notice_with_negation_words_is_consistent():
+    model = MockComparisonModel()
+    text = (
+        "AUXILIARY EXAMINATIONS (AUGUST 2026)\n"
+        "The students will not have to attend any classes.\n"
+        "Registration fee will not be refunded."
+    )
+    label, confidence, rationale = model.classify(text, text)
+    assert label == "consistent", (label, rationale)
+    assert confidence >= 0.8
+
+
 def _make_notice(db, kind, text, institution_id=1, action=None, audience=None):
     notice = Notice(
         kind=kind,

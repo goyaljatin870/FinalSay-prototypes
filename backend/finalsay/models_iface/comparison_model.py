@@ -130,8 +130,25 @@ class MockComparisonModel(ComparisonModel):
                     f"Notices assert conflicting dates {p_dates} vs {h_dates}.",
                 )
 
-        # Explicit negation cue.
-        if re.search(r"\b(not|no longer|will not|won't|isn't|is not)\b", combined):
+        # Lexical overlap and negation reasoning.
+        overlap = _overlap(premise, hypothesis)
+        has_neg_premise = bool(
+            re.search(r"\b(not|no longer|will not|won't|isn't|is not)\b", p_low)
+        )
+        has_neg_hypothesis = bool(
+            re.search(r"\b(not|no longer|will not|won't|isn't|is not)\b", h_low)
+        )
+
+        # Very high overlap: matching notice copy.
+        if overlap >= 0.75:
+            return (
+                "consistent",
+                0.82,
+                f"High lexical overlap ({overlap:.2f}) and no conflicting facts.",
+            )
+
+        # Hypothesis asserts negation contradicting a positive premise.
+        if has_neg_hypothesis and not has_neg_premise:
             return (
                 "contradictory",
                 0.78,
@@ -139,7 +156,6 @@ class MockComparisonModel(ComparisonModel):
             )
 
         # High lexical overlap with no conflicting signal -> consistent.
-        overlap = _overlap(premise, hypothesis)
         if overlap >= 0.6:
             return (
                 "consistent",
