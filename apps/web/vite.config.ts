@@ -3,8 +3,8 @@ import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
 // For GitHub Pages under https://<username>.github.io/FinalSay-prototypes/
-// Falls back to '/' if VITE_BASE_URL is explicitly set to empty/root.
-const base = process.env.VITE_BASE_URL ?? '/FinalSay-prototypes/'
+// Falls back to '/' if VITE_BASE_URL is not set or empty.
+const base = process.env.VITE_BASE_URL || '/'
 const apiProxyTarget = process.env.FINALSAY_API_PROXY_TARGET ?? 'http://127.0.0.1:8000'
 
 export default defineConfig({
