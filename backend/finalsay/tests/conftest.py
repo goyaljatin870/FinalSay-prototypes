@@ -9,6 +9,7 @@ test session (no persistent server is involved).
 from __future__ import annotations
 
 import atexit
+import glob
 import os
 import shutil
 import tempfile
@@ -19,6 +20,12 @@ import pytest
 # Configure an isolated temp SQLite DB before any finalsay import. We keep the
 # DB under the backend tree (not /tmp, which is wiped between tool invocations).
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# Clean up any stale test dirs from previous aborted runs
+for item in glob.glob(os.path.join(_BACKEND_DIR, "finalsay-test-*")):
+    if os.path.isdir(item):
+        shutil.rmtree(item, ignore_errors=True)
+
 _TMP_DIR = tempfile.mkdtemp(prefix="finalsay-test-", dir=_BACKEND_DIR)
 _DB_PATH = os.path.join(_TMP_DIR, "test.db")
 os.environ["FINALSAY_DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
@@ -29,7 +36,17 @@ os.environ["FINALSAY_COMPARISON_MODEL"] = "mock"
 # API tests must never start a real background scrape or depend on network state.
 os.environ["FINALSAY_SCRAPE_INTERVAL_SECONDS"] = "0"
 
-atexit.register(lambda: shutil.rmtree(_TMP_DIR, ignore_errors=True))
+
+def _cleanup():
+    try:
+        from finalsay.db import engine
+        engine.dispose()
+    except Exception:
+        pass
+    shutil.rmtree(_TMP_DIR, ignore_errors=True)
+
+
+atexit.register(_cleanup)
 
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402

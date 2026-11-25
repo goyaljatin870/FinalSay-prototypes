@@ -43,7 +43,7 @@ def register(payload: UserRegister, db: Session = Depends(get_db)) -> UserOut:
             or institution.scrape_type == "fixture"
         ):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Select an active supported college.",
             )
     user = User(
@@ -132,7 +132,7 @@ def update_student_institution(
         or institution.scrape_type == "fixture"
     ):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Select an active supported college.",
         )
     current_user.institution_id = institution.id

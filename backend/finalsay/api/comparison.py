@@ -33,7 +33,7 @@ def compare(
         )
     if submission.kind != "submission":
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="comparison requires a submission notice",
         )
     ensure_notice_access(submission, current_user)

@@ -1020,6 +1020,20 @@ def test_sources_crud(client: TestClient, make_user):
     assert created.status_code == 201, created.text
     assert created.json()["slug"] == "test-uni"
 
+    # Add an institution with generic scraper on custom domain -> 201
+    generic_res = client.post(
+        "/api/ingest/sources",
+        json={
+            "name": "Custom College",
+            "slug": "custom-college",
+            "source_url": "https://customcollege.edu/notices",
+            "scrape_type": "generic_html",
+        },
+        headers=_auth(admin),
+    )
+    assert generic_res.status_code == 201, generic_res.text
+    assert generic_res.json()["scrape_type"] == "generic_html"
+
     # Duplicate slug -> 409.
     dup = client.post(
         "/api/ingest/sources",

@@ -10,6 +10,8 @@ backend/.venv-*/
 
 # Databases / runtime artifacts
 *.db
+*.db-shm
+*.db-wal
 finalsay.db
 backend/finalsay.db
 backend/finalsay-test-*/

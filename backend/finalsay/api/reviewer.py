@@ -124,7 +124,7 @@ def resolve(
 ) -> ResolveResponse:
     if payload.label not in RELATIONSHIP_LABELS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"label must be one of {RELATIONSHIP_LABELS}",
         )
     case = db.get(ReviewCase, case_id)
@@ -219,7 +219,7 @@ def benchmark_annotate(
 ) -> BenchmarkPairOut:
     if payload.label not in RELATIONSHIP_LABELS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"label must be one of {RELATIONSHIP_LABELS}",
         )
     pair = db.get(BenchmarkPair, payload.pair_id)

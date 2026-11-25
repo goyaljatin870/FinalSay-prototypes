@@ -3,14 +3,15 @@ import { Link } from 'react-router-dom'
 import { api, errorMessage } from '../../api/client'
 import type { BenchmarkCandidateOut, FetchResponse, InstitutionOut, IssuerMembershipOut, ScrapeRunOut, ScrapeSchedule } from '../../api/types'
 
-type ScrapeType = InstitutionOut['scrape_type']
-const SCRAPERS: Array<{ value: ScrapeType; label: string }> = [
+const SCRAPERS: Array<{ value: string; label: string }> = [
+  { value: 'generic_html', label: 'Generic notice board (HTML/PDF)' },
   { value: 'thapar_html', label: 'Thapar notice board (HTML/PDF)' },
-  { value: 'nitj_api', label: 'NIT Jalandhar academic notices (JSON/PDF)' },
-  { value: 'iitb_html', label: 'IIT Bombay academic notices (HTML/PDF)' },
   { value: 'vtu_examination', label: 'VTU examination notices (paginated HTML/PDF)' },
   { value: 'du_examination', label: 'University of Delhi examination notices (paginated HTML/PDF)' },
   { value: 'mumbai_circulars', label: 'University of Mumbai circulars (HTML/PDF)' },
+  { value: 'nitj_api', label: 'NIT Jalandhar academic notices (JSON/PDF)' },
+  { value: 'iitb_html', label: 'IIT Bombay academic notices (HTML/PDF)' },
+  { value: 'custom', label: 'Custom scraper' },
 ]
 
 // Admin source management is wired to institution CRUD and the real scraper.
@@ -24,10 +25,12 @@ export default function SourcesPage() {
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [sourceUrl, setSourceUrl] = useState('')
-  const [scrapeType, setScrapeType] = useState<ScrapeType>('vtu_examination')
+  const [scrapeType, setScrapeType] = useState<string>('generic_html')
+  const [customScrapeType, setCustomScrapeType] = useState('')
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editUrl, setEditUrl] = useState('')
-  const [editType, setEditType] = useState<ScrapeType>('vtu_examination')
+  const [editType, setEditType] = useState<string>('generic_html')
+  const [editCustomScrapeType, setEditCustomScrapeType] = useState('')
   const [editEnabled, setEditEnabled] = useState(false)
   const [editActive, setEditActive] = useState(true)
   const [error, setError] = useState('')
@@ -68,19 +71,21 @@ export default function SourcesPage() {
     setError('')
     setMessage('')
     setBusy(true)
+    const finalScrapeType = scrapeType === 'custom' ? (customScrapeType.trim() || 'generic_html') : scrapeType
     try {
       await api.post('/ingest/sources', {
         name,
         slug,
         source_url: sourceUrl || null,
-        scrape_type: scrapeType,
+        scrape_type: finalScrapeType,
         scrape_enabled: true,
         active: true,
       })
       setName('')
       setSlug('')
       setSourceUrl('')
-      setScrapeType('vtu_examination')
+      setScrapeType('generic_html')
+      setCustomScrapeType('')
       setMessage('Institution source added.')
       await load()
     } catch (err) {
@@ -93,7 +98,9 @@ export default function SourcesPage() {
   const beginEdit = (source: InstitutionOut) => {
     setEditingId(source.id)
     setEditUrl(source.source_url ?? '')
-    setEditType(source.scrape_type)
+    const known = SCRAPERS.some((item) => item.value === source.scrape_type && item.value !== 'custom')
+    setEditType(known ? source.scrape_type : 'custom')
+    setEditCustomScrapeType(known ? '' : source.scrape_type)
     setEditEnabled(source.scrape_enabled)
     setEditActive(source.active)
   }
@@ -102,15 +109,33 @@ export default function SourcesPage() {
     setError('')
     setMessage('')
     setBusy(true)
+    const finalEditType = editType === 'custom' ? (editCustomScrapeType.trim() || 'generic_html') : editType
     try {
       await api.put(`/ingest/sources/${source.id}`, {
         source_url: editUrl || null,
-        scrape_type: editType,
+        scrape_type: finalEditType,
         scrape_enabled: editEnabled,
         active: editActive,
       })
       setEditingId(null)
       setMessage(`Updated source ${source.slug}.`)
+      await load()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeSource = async (source: InstitutionOut) => {
+    if (!window.confirm(`Delete or deactivate source "${source.name}" (${source.slug})?`)) return
+    setError('')
+    setMessage('')
+    setBusy(true)
+    try {
+      const res = await api.delete<{ status: string; message: string }>(`/ingest/sources/${source.id}`)
+      setMessage(res.data.message || `Removed source ${source.slug}.`)
+      if (editingId === source.id) setEditingId(null)
       await load()
     } catch (err) {
       setError(errorMessage(err))
@@ -313,11 +338,14 @@ export default function SourcesPage() {
                   </td>
                   <td>
                     {source.extracted_count}/{source.current_notice_count} extracted ·{' '}
-                    {source.listing_only_count} listing-only · {source.unextractable_count} failed ·{' '}
+                    {source.listing_only_count} listing-only · {source.unextractable_count} unextractable ·{' '}
                     {source.unknown_extraction_count} unknown
                   </td>
                   <td><Link to={`/notices?institution_id=${source.id}`}>Browse notices</Link></td>
-                  <td><button type="button" onClick={() => beginEdit(source)}>Configure</button></td>
+                  <td>
+                    <button type="button" onClick={() => beginEdit(source)}>Configure</button>{' '}
+                    <button type="button" className="btn-secondary" disabled={busy} onClick={() => void removeSource(source)}>Remove</button>
+                  </td>
                 </tr>
                 )
               })}
@@ -329,10 +357,21 @@ export default function SourcesPage() {
             <h2>Configure source #{editingId}</h2>
             <label>
               Scraper
-              <select value={editType} onChange={(ev) => setEditType(ev.target.value as ScrapeType)}>
+              <select value={editType} onChange={(ev) => setEditType(ev.target.value)}>
                 {SCRAPERS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </label>
+            {editType === 'custom' && (
+              <label>
+                Custom scraper type
+                <input
+                  value={editCustomScrapeType}
+                  onChange={(ev) => setEditCustomScrapeType(ev.target.value)}
+                  placeholder="e.g. generic_html"
+                  required
+                />
+              </label>
+            )}
             <label>
               Public listing/feed URL
               <input value={editUrl} onChange={(ev) => setEditUrl(ev.target.value)} />
@@ -426,10 +465,21 @@ export default function SourcesPage() {
           <label>Slug<input value={slug} onChange={(ev) => setSlug(ev.target.value)} required /></label>
           <label>
             Scraper
-            <select value={scrapeType} onChange={(ev) => setScrapeType(ev.target.value as ScrapeType)}>
+            <select value={scrapeType} onChange={(ev) => setScrapeType(ev.target.value)}>
               {SCRAPERS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
             </select>
           </label>
+          {scrapeType === 'custom' && (
+            <label>
+              Custom scraper type
+              <input
+                value={customScrapeType}
+                onChange={(ev) => setCustomScrapeType(ev.target.value)}
+                placeholder="e.g. generic_html"
+                required
+              />
+            </label>
+          )}
           <label>
             Listing/feed URL
             <input
@@ -442,7 +492,7 @@ export default function SourcesPage() {
                       : scrapeType === 'vtu_examination' ? 'https://vtu.ac.in/category/examination/'
                         : scrapeType === 'du_examination' ? 'https://exam.du.ac.in/exam/index.php/notifications'
                           : scrapeType === 'mumbai_circulars' ? 'https://mu.ac.in/circular.php'
-                          : 'Enter the HTTPS listing URL on the official institution domain'
+                            : 'https://yourcollege.edu/notices (Enter the official HTTPS notice board URL)'
               }
               required
             />

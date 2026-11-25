@@ -104,17 +104,15 @@ def create_app() -> FastAPI:
         admin_email = "admin@finalsay.local"
         existing_admin = db.scalar(select(User).where(User.email == admin_email))
         if existing_admin is None:
-            admins_count = db.scalar(select(func.count(User.id)).where(User.role == "admin")) or 0
-            if admins_count == 0:
-                demo_admin = User(
-                    email=admin_email,
-                    hashed_password=hash_password("AdminPass12345678!"),
-                    role="admin",
-                    display_name="Administrator",
-                )
-                db.add(demo_admin)
-                db.commit()
-                logger.info("Provisioned demo admin %s", admin_email)
+            demo_admin = User(
+                email=admin_email,
+                hashed_password=hash_password("AdminPass12345678!"),
+                role="admin",
+                display_name="Administrator",
+            )
+            db.add(demo_admin)
+            db.commit()
+            logger.info("Provisioned demo admin %s", admin_email)
 
         student_email = "student@finalsay.local"
         existing_student = db.scalar(select(User).where(User.email == student_email))

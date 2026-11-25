@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+import re
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+_EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+
+def _validate_app_email(val: str) -> str:
+    cleaned = str(val).strip().lower()
+    if not _EMAIL_REGEX.match(cleaned):
+        raise ValueError("Invalid email address format")
+    return cleaned
+
+
+AppEmail = Annotated[str, AfterValidator(_validate_app_email)]
 
 
 class HealthResponse(BaseModel):
@@ -17,7 +30,7 @@ class HealthResponse(BaseModel):
 class UserRegister(BaseModel):
     # No ``role`` field: public self-registration always creates a student
     # account. Privileged roles are provisioned only by trusted operator tools.
-    email: EmailStr
+    email: AppEmail
     password: str = Field(min_length=6)
     display_name: str | None = None
     institution_id: int | None = None
@@ -28,7 +41,7 @@ class StudentInstitutionUpdate(BaseModel):
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: AppEmail
     password: str
 
 
@@ -41,7 +54,7 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    email: EmailStr
+    email: AppEmail
     role: str
     display_name: str | None = None
     institution_id: int | None = None
@@ -312,10 +325,7 @@ class InstitutionCreate(BaseModel):
     name: str
     slug: str
     source_url: str | None = None
-    scrape_type: Literal[
-        "thapar_html", "nitj_api", "iitb_html",
-        "vtu_examination", "du_examination", "mumbai_circulars",
-    ]
+    scrape_type: str = "generic_html"
     scrape_enabled: bool = False
     active: bool = True
 
@@ -323,10 +333,7 @@ class InstitutionCreate(BaseModel):
 class InstitutionUpdate(BaseModel):
     name: str | None = None
     source_url: str | None = None
-    scrape_type: Literal[
-        "thapar_html", "nitj_api", "iitb_html",
-        "vtu_examination", "du_examination", "mumbai_circulars",
-    ] | None = None
+    scrape_type: str | None = None
     scrape_enabled: bool | None = None
     active: bool | None = None
 
@@ -355,13 +362,13 @@ class InstitutionOut(BaseModel):
 
 
 class IssuerMembershipCreate(BaseModel):
-    issuer_email: EmailStr
+    issuer_email: AppEmail
     institution_id: int
 
 
 class IssuerMembershipOut(BaseModel):
     user_id: int
-    issuer_email: EmailStr
+    issuer_email: AppEmail
     display_name: str | None = None
     institution_id: int
     institution_name: str

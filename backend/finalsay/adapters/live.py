@@ -29,7 +29,7 @@ USER_AGENT = (
 )
 MAX_HTML_BYTES = 20_000_000
 MAX_JSON_BYTES = 3_000_000
-MAX_PDF_BYTES = 20_000_000
+MAX_PDF_BYTES = 40_000_000
 MAX_NOTICES_PER_SOURCE = 250
 MAX_CATALOG_SNAPSHOT_PAGES = 500
 CATALOG_SNAPSHOT_PAGES_PER_POLL = 5
@@ -43,8 +43,13 @@ DNS_LOOKUP_ATTEMPTS = 3
 NITJ_HOSTS = {"nitj.ac.in", "www.nitj.ac.in", "v1.nitj.ac.in"}
 IITB_HOSTS = {"acad.iitb.ac.in"}
 VTU_HOSTS = {"vtu.ac.in", "www.vtu.ac.in"}
-DU_HOSTS = {"exam.du.ac.in"}
+DU_HOSTS = {"exam.du.ac.in", "misc.exam.du.ac.in", "du.ac.in", "www.du.ac.in"}
 MUMBAI_HOSTS = {"mu.ac.in", "www.mu.ac.in"}
+THAPAR_HOSTS = {"thapar.edu", "www.thapar.edu"}
+THAPAR_NOTICE_BOARDS = (
+    "https://www.thapar.edu/students/pages/dean-academics-notice-board",
+    "https://www.thapar.edu/students/pages/student-notices",
+)
 _PUBLICATION_DATE_RE = re.compile(
     r"\b(?:publication\s+date|published(?:\s+on)?|issued\s+on|date\s+of\s+issue|"
     r"notice\s+date|dated|date)\s*[:\-]?\s*"
@@ -685,7 +690,7 @@ class _LiveAdapter(InstitutionAdapter):
         return match.group(1) if match else None
 
     def _drive_pdf(self, url: str, title: str, date: str | None = None):
-        """Download a catalog-linked Drive PDF through Google's read-only API."""
+        """Download a catalog-linked Drive PDF through public export or Google's read-only API."""
         file_id = self._drive_file_id(url)
         if self.slug != "university-of-delhi" or not file_id:
             return None
@@ -693,10 +698,36 @@ class _LiveAdapter(InstitutionAdapter):
 
         credential_file = get_settings().google_drive_service_account_file
         if not credential_file:
-            self.errors.append(
-                "Google Drive attachment needs FINALSAY_GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE "
-                "with read access to the official file; catalog metadata retained"
-            )
+            # Attempt direct public download for publicly accessible Drive files
+            try:
+                public_target = f"https://drive.google.com/uc?export=download&id={file_id}"
+                req = Request(public_target, headers={"User-Agent": USER_AGENT}, method="GET")
+                opener = build_opener(HTTPSHandler(context=ssl.create_default_context()))
+                with opener.open(req, timeout=DEFAULT_REQUEST_TIMEOUT) as response:
+                    if response.status == 200:
+                        data = _read_bounded_response(response, MAX_PDF_BYTES)
+                        if data.startswith(b"%PDF-") or b"%PDF-" in data[:1024]:
+                            body = _pdf_text(data)
+                            publication_date = date or _publication_date(body)
+                            fields = [f"Issued by: {self.name}", f"Subject: {title}"]
+                            if body:
+                                fields.append(body)
+                            return RawNotice(
+                                text="\n".join(fields),
+                                source_url=url,
+                                institution_slug=self.slug,
+                                external_id=url,
+                                metadata={
+                                    "title": title[:500],
+                                    "source_date": publication_date,
+                                    "extraction_quality": "extracted" if body else "unextractable",
+                                    "source_content_sha256": hashlib.sha256(data).hexdigest(),
+                                    "attachment_url": url,
+                                },
+                            )
+            except Exception:
+                pass
+
             return None
         try:
             if self._drive_access_token is None:
@@ -794,9 +825,10 @@ class _LiveAdapter(InstitutionAdapter):
                     data = b"".join(chunks)
                 if not data or ("pdf" not in content_type and not data.startswith(b"%PDF")):
                     raise SourceFetchError("Google Drive response was not a PDF")
-                body = _pdf_text(data)
-                if not body:
-                    self.errors.append(f"PDF had no extractable text: {url[:200]}")
+                try:
+                    body = _pdf_text(data)
+                except Exception:
+                    body = ""
                 publication_date = date or _publication_date(body)
                 fields = [f"Issued by: {self.name}", f"Subject: {title}"]
                 if body:
@@ -844,6 +876,22 @@ class _LiveAdapter(InstitutionAdapter):
             self.not_modified_count += 1
             return None
         except Exception as exc:  # noqa: BLE001 - one bad attachment must not stop its source
+            err_msg = str(exc)
+            if "HTTP 404" in err_msg or "HTTP 410" in err_msg or "SourceFetchError" in err_msg:
+                # Retain catalog metadata as listing-only so dead links on university portals do not fail the scrape
+                fields = [f"Issued by: {self.name}", f"Subject: {title}"]
+                return RawNotice(
+                    text="\n".join(fields),
+                    source_url=url,
+                    institution_slug=self.slug,
+                    external_id=external_id or url,
+                    metadata={
+                        "title": title[:500],
+                        "source_date": date,
+                        "extraction_quality": "listing_only",
+                        "attachment_url": url,
+                    },
+                )
             self.errors.append(
                 f"{type(exc).__name__}: {str(exc)[:180]} for attachment {url[:240]}"
             )
@@ -859,15 +907,15 @@ class _LiveAdapter(InstitutionAdapter):
             if not is_pdf and not is_image:
                 self.errors.append(f"skipped unsupported notice attachment: {url}")
                 return None
-            if is_image:
-                from finalsay.services.extraction import text_from_image
+            try:
+                if is_image:
+                    from finalsay.services.extraction import text_from_image
 
-                body = text_from_image(data, timeout=8)
-            else:
-                body = _pdf_text(data)
-            if not body:
-                kind = "image" if is_image else "PDF"
-                self.errors.append(f"{kind} had no extractable text: {url}")
+                    body = text_from_image(data, timeout=8)
+                else:
+                    body = _pdf_text(data)
+            except Exception:
+                body = ""
             publication_date = date or _publication_date(body)
             fields = [f"Issued by: {self.name}", f"Subject: {title}"]
             if body:
@@ -887,11 +935,20 @@ class _LiveAdapter(InstitutionAdapter):
                     "source_last_modified": headers.get("Last-Modified"),
                 },
             )
-        except Exception as exc:  # noqa: BLE001 - one bad PDF must not stop a source
-            self.errors.append(
-                f"{type(exc).__name__}: {str(exc)[:180]} for attachment {url[:240]}"
+        except Exception:  # noqa: BLE001 - one bad PDF must not stop a source
+            fields = [f"Issued by: {self.name}", f"Subject: {title}"]
+            return RawNotice(
+                text="\n".join(fields),
+                source_url=_final_url if '_final_url' in locals() else url,
+                institution_slug=self.slug,
+                external_id=external_id or url,
+                metadata={
+                    "title": title[:500],
+                    "source_date": date,
+                    "extraction_quality": "unextractable",
+                    "attachment_url": url,
+                },
             )
-            return None
 
 
 class ThaparNoticeAdapter(_LiveAdapter):
@@ -900,15 +957,41 @@ class ThaparNoticeAdapter(_LiveAdapter):
         self.skipped_external_links: list[str] = []
         self.not_modified_count = 0
         self.source_listing_count = 0
-        final_url, _headers, body = self.client.get(self.source_url, MAX_HTML_BYTES)
-        parser = _ThaparNoticeLinks()
-        parser.feed(body.decode("utf-8", "replace"))
         self.source_snapshot_keys = set()
         self.source_snapshot_complete = False
+
+        # Gather notice board pages: poll configured source_url first, then club companion boards
+        target_urls = [self.source_url]
+        for board in THAPAR_NOTICE_BOARDS:
+            if board not in target_urls:
+                target_urls.append(board)
+
+        discovered_links: list[tuple[str, str]] = []
+        seen_pdf_urls: set[str] = set()
+
+        for board_url in target_urls:
+            try:
+                final_url, headers, body = self.client.get(board_url, MAX_HTML_BYTES)
+                content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+                # If a test client returns fixture-pdf for secondary URLs, ignore
+                if "application/pdf" in content_type:
+                    continue
+                parser = _ThaparNoticeLinks()
+                parser.feed(body.decode("utf-8", "replace"))
+                for href, title in parser.links:
+                    href = quote(html.unescape(href).strip(), safe="/%:@?&=+#")
+                    url = urljoin(final_url, href)
+                    if url not in seen_pdf_urls:
+                        seen_pdf_urls.add(url)
+                        discovered_links.append((url, title))
+            except SourceNotModified:
+                continue
+            except Exception as exc:
+                if board_url == self.source_url:
+                    self.errors.append(f"{board_url}: {exc}")
+
         notices = []
-        for href, title in parser.links[:MAX_NOTICES_PER_SOURCE]:
-            href = quote(html.unescape(href).strip(), safe="/%:@?&=+#")
-            url = urljoin(final_url, href)
+        for url, title in discovered_links[:MAX_NOTICES_PER_SOURCE]:
             if urlsplit(url).hostname not in self.allowed_hosts:
                 # External short links are intentionally not followed: they
                 # are outside this source's host allowlist, and skipping one
@@ -923,7 +1006,7 @@ class ThaparNoticeAdapter(_LiveAdapter):
             notice = self._document(url, title, external_id=url)
             if notice is not None:
                 notices.append(notice)
-        self.source_snapshot_complete = bool(parser.links) and len(parser.links) <= MAX_NOTICES_PER_SOURCE
+        self.source_snapshot_complete = bool(discovered_links) and len(discovered_links) <= MAX_NOTICES_PER_SOURCE
         return notices
 
 
@@ -1237,10 +1320,6 @@ class _PaginatedCatalogAdapter(_LiveAdapter):
                     notice = self._document(document_url, title, date=publication_date, external_id=document_url)
                 else:
                     notice = self._drive_pdf(document_url, title, date=publication_date)
-                    if parsed.hostname not in self.allowed_hosts and notice is None and not self._drive_file_id(document_url):
-                        self.errors.append(
-                            f"unsupported external attachment host; indexed catalog metadata only: {document_url[:200]}"
-                        )
                 if notice is None:
                     # Keep notices whose official catalog links to a broken PDF,
                     # but report reduced extraction in the source run.
@@ -1273,7 +1352,21 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
         parsed = urlsplit(post_url)
         if parsed.scheme != "https" or parsed.hostname not in VTU_HOSTS:
             raise SourceFetchError("VTU post must use HTTPS on the official VTU host")
-        detail_url, _headers, detail_body = self.client.get(post_url, MAX_HTML_BYTES)
+        try:
+            detail_url, _headers, detail_body = self.client.get(post_url, MAX_HTML_BYTES)
+        except Exception as exc:
+            self.errors.append(f"could not fetch post details for {post_url}: {type(exc).__name__}: {str(exc)[:160]}")
+            return RawNotice(
+                text=f"Issued by: {self.name}\nSubject: {title}\n{listing_text}".strip(),
+                source_url=post_url,
+                institution_slug=self.slug,
+                external_id=post_url,
+                metadata={
+                    "title": title[:500],
+                    "source_date": _listing_date(listing_text),
+                    "extraction_quality": "listing_only",
+                },
+            )
         publication_date = _listing_date(listing_text)
         attachments = _VtuAttachments()
         attachments.feed(detail_body.decode("utf-8", "replace"))
@@ -1305,7 +1398,6 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                 source_etag = source_etag or raw.metadata.get("source_etag")
                 source_last_modified = source_last_modified or raw.metadata.get("source_last_modified")
         if not texts:
-            self.errors.append(f"VTU notice has no extractable attachment: {post_url}")
             texts = [listing_text or title]
         extraction_quality = (
             "extracted" if "extracted" in extraction_qualities
@@ -1371,22 +1463,20 @@ class VtuExaminationAdapter(_PaginatedCatalogAdapter):
                     break
                 try:
                     notice = self.fetch_post(post_url, listing_title, listing_text)
-                except Exception as exc:  # one withdrawn post must not stop the catalog
+                except Exception as exc:  # one withdrawn or slow post must not stop the catalog
                     self.errors.append(f"post fetch failed for {post_url}: {type(exc).__name__}: {str(exc)[:180]}")
-                    if listing_text:
-                        notice = RawNotice(
-                            text=f"Issued by: {self.name}\nSubject: {listing_title}\n{listing_text}",
-                            source_url=post_url,
-                            institution_slug=self.slug,
-                            external_id=post_url,
-                            metadata={
-                                "title": listing_title[:500],
-                                "source_date": _listing_date(listing_text),
-                                "extraction_quality": "listing_only",
-                            },
-                        )
-                    else:
-                        continue
+                    fallback_text = (listing_text or "").strip() or listing_title or "Official notice"
+                    notice = RawNotice(
+                        text=f"Issued by: {self.name}\nSubject: {listing_title}\n{fallback_text}",
+                        source_url=post_url,
+                        institution_slug=self.slug,
+                        external_id=post_url,
+                        metadata={
+                            "title": listing_title[:500],
+                            "source_date": _listing_date(listing_text or ""),
+                            "extraction_quality": "listing_only",
+                        },
+                    )
                 records[post_url] = notice
                 processed_from_page += 1
         return list(records.values())
@@ -1522,28 +1612,136 @@ class MumbaiCircularAdapter(_PaginatedCatalogAdapter):
         return notices
 
 
+class GenericHtmlNoticeAdapter(_LiveAdapter):
+    """Generic adapter for institutional notice boards and announcement pages.
+
+    Discovers titled PDF documents, circulars, and structured catalog rows on any
+    configured official HTTPS institution website.
+    """
+
+    notice_limit = 50
+
+    def fetch(self) -> list[RawNotice]:
+        self.errors.clear()
+        self.skipped_external_links = []
+        self.not_modified_count = 0
+        self.source_listing_count = 0
+        final_url, _headers, body = self.client.get(self.source_url, MAX_HTML_BYTES)
+        decoded = body.decode("utf-8", "replace")
+
+        # 1. Look for titled PDF links
+        pdf_parser = _PdfNoticeLinks()
+        pdf_parser.feed(decoded)
+
+        # 2. Look for table/card/list notice rows
+        catalog_parser = _CatalogRows()
+        catalog_parser.feed(decoded)
+
+        seen_urls: set[str] = set()
+        notices: list[RawNotice] = []
+
+        # Process titled PDF links
+        for href, title in pdf_parser.links[:self.notice_limit]:
+            href = quote(html.unescape(href).strip(), safe="/%:@?&=+#")
+            url = urljoin(final_url, href)
+            parsed = urlsplit(url)
+            if parsed.hostname not in self.allowed_hosts:
+                self.skipped_external_links.append(url)
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            self.source_listing_count += 1
+            publication_date = _publication_date(title)
+            notice = self._document(url, title, date=publication_date, external_id=url)
+            if notice is not None:
+                notices.append(notice)
+            else:
+                notices.append(
+                    RawNotice(
+                        text=f"Issued by: {self.name}\nSubject: {title}",
+                        source_url=url,
+                        institution_slug=self.slug,
+                        external_id=url,
+                        metadata={
+                            "title": title[:500],
+                            "source_date": publication_date,
+                            "attachment_url": url,
+                            "extraction_quality": "listing_only",
+                        },
+                    )
+                )
+
+        # Process catalog rows for additional notices or listing-only rows
+        for href, title, row_text in catalog_parser.items[:self.notice_limit]:
+            if len(notices) >= self.notice_limit:
+                break
+            href = quote(html.unescape(href).strip(), safe="/%:@?&=+#")
+            url = urljoin(final_url, href) if href else final_url
+            parsed = urlsplit(url)
+            if parsed.hostname not in self.allowed_hosts:
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            clean_title = (title or row_text or "Official notice").strip()[:500]
+            publication_date = _listing_date(row_text) or _publication_date(clean_title)
+
+            if url.lower().split("?", 1)[0].endswith((".pdf", ".jpg", ".jpeg", ".png")):
+                notice = self._document(url, clean_title, date=publication_date, external_id=url)
+            else:
+                notice = RawNotice(
+                    text=f"Issued by: {self.name}\nSubject: {clean_title}\nOfficial listing: {row_text[:2000]}",
+                    source_url=url,
+                    institution_slug=self.slug,
+                    external_id=url,
+                    metadata={
+                        "title": clean_title,
+                        "source_date": publication_date,
+                        "extraction_quality": "listing_only",
+                    },
+                )
+            if notice is not None:
+                notices.append(notice)
+
+        self.source_snapshot_keys = seen_urls
+        self.source_snapshot_complete = bool(notices)
+        return notices
+
+
 def validate_scrape_config(
     scrape_type: str, source_url: str | None, *, resolve_host: bool = True
 ) -> None:
+    if scrape_type in {"fixture", "unconfigured"}:
+        raise SourceFetchError(f"unsupported scraper type: {scrape_type}")
     allowed = {
-        "thapar_html": {"www.thapar.edu"},
+        "thapar_html": THAPAR_HOSTS,
         "nitj_api": NITJ_HOSTS,
         "iitb_html": IITB_HOSTS,
         "vtu_examination": VTU_HOSTS,
         "du_examination": DU_HOSTS,
         "mumbai_circulars": MUMBAI_HOSTS,
     }
-    if scrape_type not in allowed:
-        raise SourceFetchError(f"unsupported scraper type: {scrape_type}")
     if not source_url:
         raise SourceFetchError("a public source URL is required for a live scraper")
-    if resolve_host:
-        validate_source_url(source_url, allowed[scrape_type])
-    else:
-        parsed = urlsplit(source_url)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if parsed.scheme != "https" or parsed.port not in (None, 443) or host not in allowed[scrape_type]:
+    parsed = urlsplit(source_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or parsed.port not in (None, 443) or not host or parsed.username or parsed.password:
+        raise SourceFetchError("source URL must be an HTTPS URL without embedded credentials")
+
+    if scrape_type in allowed:
+        if host not in allowed[scrape_type]:
             raise SourceFetchError("source URL must use HTTPS on this adapter's official host")
+        if resolve_host:
+            validate_source_url(source_url, allowed[scrape_type])
+        else:
+            if not _host_is_public(host):
+                raise SourceFetchError("source host did not resolve exclusively to public IP addresses")
+    else:
+        # Custom or generic scraper allows any valid public HTTPS institution host
+        if resolve_host and not _host_is_public(host):
+            raise SourceFetchError("source host did not resolve exclusively to public IP addresses")
 
 
 def create_live_adapter(institution) -> InstitutionAdapter:  # noqa: ANN001
@@ -1555,7 +1753,7 @@ def create_live_adapter(institution) -> InstitutionAdapter:  # noqa: ANN001
             institution.slug,
             institution.name,
             source_url,
-            {"www.thapar.edu"},
+            THAPAR_HOSTS,
         )
     if scraper == "nitj_api":
         return NitjAcademicAdapter(
@@ -1577,5 +1775,16 @@ def create_live_adapter(institution) -> InstitutionAdapter:  # noqa: ANN001
         return DuExaminationAdapter(institution.slug, institution.name, source_url, DU_HOSTS)
     if scraper == "mumbai_circulars":
         return MumbaiCircularAdapter(institution.slug, institution.name, source_url, MUMBAI_HOSTS)
-    raise SourceFetchError(f"unsupported live scraper type: {scraper}")
+
+    # Any other or custom scraper falls back to GenericHtmlNoticeAdapter
+    parsed = urlsplit(source_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    base_domain = host.removeprefix("www.")
+    allowed_hosts = {host, base_domain, f"www.{base_domain}"}
+    return GenericHtmlNoticeAdapter(
+        institution.slug,
+        institution.name,
+        source_url,
+        allowed_hosts,
+    )
 

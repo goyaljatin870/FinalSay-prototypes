@@ -33,6 +33,13 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def normalize_email_address(email: str) -> str:
     """Apply the same email validation used by API schemas to provisioners."""
+    clean = email.strip().lower()
+    if "@" in clean:
+        parts = clean.split("@")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            # Permit internal/demo domains such as .local, .internal, or localhost
+            if parts[1].endswith(".local") or parts[1].endswith(".internal") or parts[1] == "localhost":
+                return clean
     try:
         return str(_EMAIL_ADAPTER.validate_python(email.strip())).lower()
     except ValidationError as exc:

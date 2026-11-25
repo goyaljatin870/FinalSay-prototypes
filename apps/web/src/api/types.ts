@@ -207,7 +207,7 @@ export interface InstitutionOut {
   name: string
   slug: string
   source_url: string | null
-  scrape_type: 'fixture' | 'thapar_html' | 'nitj_api' | 'iitb_html' | 'vtu_examination' | 'du_examination' | 'mumbai_circulars'
+  scrape_type: 'fixture' | 'thapar_html' | 'nitj_api' | 'iitb_html' | 'vtu_examination' | 'du_examination' | 'mumbai_circulars' | 'generic_html' | string
   scrape_enabled: boolean
   active: boolean
   backfill_complete: boolean

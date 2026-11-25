@@ -914,26 +914,41 @@ def classify_submission(
             evidence.append("Claim check: no sufficiently specific official evidence was identified for this claim.")
             gated = True
         else:
-            detailed = getattr(model, "classify_with_evidence", None)
-            try:
-                if detailed is not None:
-                    label, confidence, rationale, model_evidence = detailed(premise, hypothesis)
-                    evidence.extend(model_evidence)
-                else:
-                    label, confidence, rationale = model.classify(premise, hypothesis)
-                    evidence.append(rationale)
-            except Exception as exc:  # model weights unavailable: return reviewable result, not 500
-                from finalsay.models_iface.semantic_model import SemanticModelUnavailable
+            sub_norm = re.sub(r"\s+", " ", submission.redacted_text or "").strip()
+            best_norm = re.sub(r"\s+", " ", best.redacted_text or "").strip()
+            has_contradict_words = bool(re.search(r"\b(cancel|postpon|reschedul|delay|extend|fake|rumou?r)", sub_norm.lower()))
 
-                if not isinstance(exc, SemanticModelUnavailable):
-                    raise
+            if sub_norm and best_norm and (sub_norm == best_norm or ((sub_norm in best_norm or best_norm in sub_norm) and not has_contradict_words)):
                 label, confidence, rationale = (
-                    "unresolved",
-                    0.0,
-                    "A likely official notice was found, but the local comparison model "
-                    "could not be loaded. Routed to reviewer without asserting a label.",
+                    "consistent",
+                    0.99 if sub_norm == best_norm else 0.88,
+                    "The submitted notice text matches the readable official notice." if sub_norm == best_norm else "The submitted notice text is contained in the readable official notice.",
                 )
-                evidence.append(str(exc))
+                gated = False
+                student_verdict = "CONFIRMED"
+                student_summary = "The text in your copy is the same as the readable official notice." if sub_norm == best_norm else "No important difference was found in the readable official notice."
+                evidence.append("Exact match: submitted text matches the official notice." if sub_norm == best_norm else "Content match: submitted text is contained in the official notice.")
+            else:
+                detailed = getattr(model, "classify_with_evidence", None)
+                try:
+                    if detailed is not None:
+                        label, confidence, rationale, model_evidence = detailed(premise, hypothesis)
+                        evidence.extend(model_evidence)
+                    else:
+                        label, confidence, rationale = model.classify(premise, hypothesis)
+                        evidence.append(rationale)
+                except Exception as exc:  # model weights unavailable: return reviewable result, not 500
+                    from finalsay.models_iface.semantic_model import SemanticModelUnavailable
+
+                    if not isinstance(exc, SemanticModelUnavailable):
+                        raise
+                    label, confidence, rationale = (
+                        "unresolved",
+                        0.0,
+                        "A likely official notice was found, but the local comparison model "
+                        "could not be loaded. Routed to reviewer without asserting a label.",
+                    )
+                    evidence.append(str(exc))
         if not claim_summary:
             # Confidence gating (GC-4): never force a guess below the threshold.
             gated = confidence < threshold or label == "unresolved"

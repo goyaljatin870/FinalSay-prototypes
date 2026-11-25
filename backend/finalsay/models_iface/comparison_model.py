@@ -139,6 +139,14 @@ class MockComparisonModel(ComparisonModel):
             re.search(r"\b(not|no longer|will not|won't|isn't|is not)\b", h_low)
         )
 
+        # Near-identical text or matching notice content without explicit contradiction/revision signals is consistent.
+        if overlap >= 0.70 and not has_neg_hypothesis and not has_postpone and not has_extend:
+            return (
+                "consistent",
+                0.88 if overlap >= 0.85 else 0.84,
+                f"High lexical overlap ({overlap:.2f}) and matching notice content.",
+            )
+
         # Very high overlap: matching notice copy.
         if overlap >= 0.75:
             return (

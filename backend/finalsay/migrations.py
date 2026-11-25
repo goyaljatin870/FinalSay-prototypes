@@ -88,7 +88,10 @@ def run_migrations(engine: Engine) -> None:
                             "WHERE published_date IS NOT NULL"
                         ).all()
                         date_updates = [
-                            {"notice_id": notice_id, "published_on": parsed}
+                            {
+                                "notice_id": notice_id,
+                                "published_on": parsed.isoformat() if hasattr(parsed, "isoformat") else str(parsed),
+                            }
                             for notice_id, raw_date in existing_dates
                             if (parsed := parse_publication_date(raw_date)) is not None
                         ]

@@ -14,10 +14,10 @@ interface NavItem {
 // Role-aware navigation: only links the signed-in role can use are shown.
 const NAV: NavItem[] = [
   { to: '/submit', label: 'Submit', roles: ['student'] },
-  { to: '/notices', label: 'Notices', roles: ['student', 'reviewer', 'admin', 'issuer'] },
+  { to: '/notices', label: 'Notices', roles: ['student'] },
   { to: '/alerts', label: 'Alerts', roles: ['student'] },
   { to: '/reviewer/queue', label: 'Queue', roles: ['reviewer', 'admin'] },
-  { to: '/reviewer/benchmark', label: 'Benchmark', roles: ['reviewer'] },
+  { to: '/reviewer/benchmark', label: 'Benchmark', roles: ['reviewer', 'admin'] },
   { to: '/admin/sources', label: 'Sources', roles: ['admin'] },
   { to: '/admin/notices', label: 'Notice review', roles: ['admin'] },
   { to: '/admin/provenance', label: 'Integrity', roles: ['admin'] },

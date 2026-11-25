@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, Navigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../auth/AuthContext'
 import { api, errorMessage } from '../../api/client'
 import type { NoticeDetail, StudentNoticeFeed, StudentNoticeItem } from '../../api/types'
@@ -25,6 +25,11 @@ function formatPublishedDate(notice: StudentNoticeItem): string {
 
 export default function NoticesPage() {
   const { user } = useAuth()
+  if (user && user.role !== 'student') {
+    if (user.role === 'admin') return <Navigate to="/admin/notices" replace />
+    if (user.role === 'reviewer') return <Navigate to="/reviewer/queue" replace />
+    if (user.role === 'issuer') return <Navigate to="/issuer/publish" replace />
+  }
   const institutionId = user?.institution_id ?? null
   const [searchParams, setSearchParams] = useSearchParams()
   const month = searchParams.get('month') ?? ''

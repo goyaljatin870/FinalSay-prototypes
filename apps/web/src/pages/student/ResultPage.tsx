@@ -156,9 +156,13 @@ export default function ResultPage() {
     return typeof value === 'string' ? value : null
   }
   const normalizedSubmissionText = (submission.redacted_text || '').replace(/\s+/g, ' ').trim()
-  const normalizedOfficialText = (matchedNoticeDetail?.redacted_text || '').replace(/\s+/g, ' ').trim()
+  const normalizedOfficialText = (matchedNoticeDetail?.redacted_text || outcome?.candidate_text || '').replace(/\s+/g, ' ').trim()
   const exactTextMatch = Boolean(
-    normalizedSubmissionText && normalizedOfficialText && normalizedSubmissionText === normalizedOfficialText,
+    normalizedSubmissionText && normalizedOfficialText && (
+      normalizedSubmissionText === normalizedOfficialText ||
+      normalizedOfficialText.includes(normalizedSubmissionText) ||
+      normalizedSubmissionText.includes(normalizedOfficialText)
+    ),
   )
   const isTypedClaim = Boolean(
     (submission.submission_mode === 'claim' || (submission.submission_mode === 'legacy' && !submission.title &&
@@ -166,31 +170,61 @@ export default function ResultPage() {
       !/\b(?:notice|notification|circular|issued by|university|registrar|subject:)\b/i.test(submission.redacted_text || ''))),
   )
 
+  const submittedField = (name: string) =>
+    submission.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || null
+  const officialField = (name: string, fallback?: string | null) =>
+    matchedNoticeDetail?.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || fallback?.trim() || null
+  const normalizeForCompare = (value: string) => value
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[.,;:()[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const comparedFields = [
+    { key: 'date', label: 'Notice date', submitted: submittedField('date'), official: officialField('date', matchedCandidate?.notice_date) },
+    { key: 'deadline', label: 'Deadline', submitted: submittedField('deadline'), official: officialField('deadline', matchedCandidate?.deadline) },
+    { key: 'audience', label: 'Who it applies to', submitted: submittedField('audience'), official: officialField('audience', matchedCandidate?.audience) },
+  ].filter((field) => field.submitted || field.official)
+
+  const fieldsWithBoth = comparedFields.filter((field) => Boolean(field.submitted && field.official))
+  const hasDifferentField = fieldsWithBoth.some(
+    (field) => normalizeForCompare(field.submitted!) !== normalizeForCompare(field.official!),
+  )
+  const hasSameField = fieldsWithBoth.some(
+    (field) => normalizeForCompare(field.submitted!) === normalizeForCompare(field.official!),
+  )
+  const allComparedSame = fieldsWithBoth.length > 0 && !hasDifferentField && hasSameField
+
+  const effectiveVerdict = (exactTextMatch || allComparedSame || (!hasDifferentField && fieldsWithBoth.length > 0)) && outcome?.student_verdict === 'CONTRADICTED'
+    ? 'CONFIRMED'
+    : outcome?.student_verdict
+
   const resultCopy = (() => {
-    if (outcome?.student_verdict) {
+    if (effectiveVerdict) {
       const copy = {
         CONFIRMED: { heading: 'This information matches the official notice', next: 'Open the official notice to check the full instructions.' },
         CONTRADICTED: { heading: 'This detail conflicts with the official notice', next: 'Follow the official notice. Contact your college if you need clarification.' },
         PARTIALLY_SUPPORTED: { heading: 'Some details are supported; others are unclear', next: 'Check the official notice and confirm the unclear detail with your college.' },
         NOT_FOUND: { heading: 'No matching official notice was found', next: 'Check again later or ask your college office to confirm.' },
         NEEDS_MANUAL_VERIFICATION: { heading: 'A possible notice needs a closer check', next: 'Open the source or ask your college office to confirm.' },
-      }[outcome.student_verdict]
+      }[effectiveVerdict]
       const documentBody = listingOnlyMatch
         ? 'A related portal listing was found, but FinalSay could not read the official document. Its details need manual checking.'
-        : outcome.label === 'consistent'
+        : outcome?.label === 'consistent' || exactTextMatch || allComparedSame || !hasDifferentField
           ? exactTextMatch
             ? 'The text in your copy is the same as the readable official notice.'
             : 'No important difference was found in the readable official notice.'
-          : outcome.label === 'superseded'
+          : outcome?.label === 'superseded'
             ? 'The institution published a newer notice. Follow its latest instructions.'
-            : outcome.label === 'extended'
+            : outcome?.label === 'extended'
               ? 'The institution published a later deadline.'
-              : outcome.label === 'corrected'
+              : outcome?.label === 'corrected'
                 ? 'The institution published a correction. Follow the corrected details.'
                 : 'Review the source below before acting on this result.'
+      const studentSummaryMatchesVerdict = !(effectiveVerdict === 'CONFIRMED' && outcome?.student_verdict === 'CONTRADICTED')
       return {
         ...copy,
-        body: outcome.student_summary || documentBody,
+        body: studentSummaryMatchesVerdict && outcome?.student_summary ? outcome.student_summary : documentBody,
       }
     }
     if (listingOnlyMatch) {
@@ -221,22 +255,6 @@ export default function ResultPage() {
           : { heading: 'No matching notice found yet', body: 'We could not find a close match in the notices currently available. This does not mean your notice is fake.', next: 'Check again later or ask your college office to confirm.' }
     }
   })()
-
-  const submittedField = (name: string) =>
-    submission.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || null
-  const officialField = (name: string, fallback?: string | null) =>
-    matchedNoticeDetail?.fields.find((field) => field.field_name.toLowerCase() === name)?.value?.trim() || fallback?.trim() || null
-  const normalizeForCompare = (value: string) => value
-    .normalize('NFKC')
-    .toLocaleLowerCase()
-    .replace(/[.,;:()[\]{}]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  const comparedFields = [
-    { key: 'date', label: 'Notice date', submitted: submittedField('date'), official: officialField('date', matchedCandidate?.notice_date) },
-    { key: 'deadline', label: 'Deadline', submitted: submittedField('deadline'), official: officialField('deadline', matchedCandidate?.deadline) },
-    { key: 'audience', label: 'Who it applies to', submitted: submittedField('audience'), official: officialField('audience', matchedCandidate?.audience) },
-  ].filter((field) => field.submitted || field.official)
   const hasOfficialDocumentText = Boolean(
     (matchedNoticeDetail?.extraction_quality === 'extracted' && matchedNoticeDetail.redacted_text?.trim()) ||
     outcome?.candidate_supplemental_extractions?.some(
@@ -251,7 +269,9 @@ export default function ResultPage() {
         <p className="muted result-submission-id">Submission #{submission.id}</p>
         {outcome ? (
           <div className="stack-sm result-summary">
-            {outcome.student_verdict && <p className="eyebrow">{outcome.student_verdict.replace(/_/g, ' ')}</p>}
+            {(effectiveVerdict || outcome.student_verdict) && (
+              <p className="eyebrow">{(effectiveVerdict || outcome.student_verdict)?.replace(/_/g, ' ')}</p>
+            )}
             <h2>{resultCopy.heading}</h2>
             <p>{resultCopy.body}</p>
             <button type="button" className="btn-secondary" disabled={rechecking} onClick={() => void recheckSubmission()}>

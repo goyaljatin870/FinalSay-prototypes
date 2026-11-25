@@ -1004,3 +1004,42 @@ def test_public_client_stops_after_bounded_transient_failures(monkeypatch):
     )
     assert status == 503
     assert len(calls) == 3
+
+
+def test_generic_scraper_allows_public_https_and_extracts_notices(monkeypatch):
+    import finalsay.adapters.live as live
+    from finalsay.adapters.live import validate_scrape_config, create_live_adapter
+
+    monkeypatch.setattr(live, "_host_is_public", lambda _host: True)
+    validate_scrape_config("generic_html", "https://newuniv.edu.in/notices", resolve_host=False)
+
+    class DummyInst:
+        slug = "new-univ"
+        name = "New University"
+        source_url = "https://newuniv.edu.in/notices"
+        scrape_type = "generic_html"
+
+    adapter = create_live_adapter(DummyInst())
+    assert adapter.slug == "new-univ"
+    assert "newuniv.edu.in" in adapter.allowed_hosts
+
+    sample_html = b"""
+    <html>
+      <body>
+        <h2>Notice Board</h2>
+        <a href="/docs/exam_schedule.pdf">Final Examination Schedule 2026</a>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(adapter.client, "get", lambda _url, _max: ("https://newuniv.edu.in/notices", {}, sample_html))
+    monkeypatch.setattr(adapter, "_document", lambda url, title, **_kw: live.RawNotice(
+        text=f"Subject: {title}\\nExam details here.",
+        source_url=url,
+        institution_slug="new-univ",
+        external_id=url,
+        metadata={"title": title, "extraction_quality": "extracted"},
+    ))
+    notices = adapter.fetch()
+    assert len(notices) == 1
+    assert notices[0].metadata["title"] == "Final Examination Schedule 2026"
+    assert notices[0].source_url == "https://newuniv.edu.in/docs/exam_schedule.pdf"

@@ -90,12 +90,12 @@ async def submit(
     """Ingest a student submission (upload or paste) and classify it."""
     if file is None and (text is None or not text.strip()):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Provide either a file (pdf/image) or pasted text.",
         )
     if text is not None and len(text) > 100_000:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="Pasted notice text exceeds the 100,000 character limit.",
         )
 
@@ -129,7 +129,7 @@ async def submit(
         institution_id = current_user.institution_id
         if institution_id not in available_institutions:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="No current official notices are available for your college yet.",
             )
     elif institution_id is None:
@@ -137,19 +137,19 @@ async def submit(
             institution_id = available_institutions[0]
         elif len(available_institutions) > 1:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Select your institution so the notice is compared only with its official notices.",
             )
     else:
         institution = db.get(Institution, institution_id)
         if institution is None or not institution.active or institution.scrape_type == "fixture":
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Select an active institution with official notice sources.",
             )
         if institution_id not in available_institutions:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="No current official notices are available for that institution yet.",
             )
 
@@ -163,7 +163,7 @@ async def submit(
         data = await file.read(MAX_SUBMISSION_UPLOAD_BYTES + 1)
         if len(data) > MAX_SUBMISSION_UPLOAD_BYTES:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail="Uploaded file exceeds the 20 MB limit.",
             )
         content_type = (file.content_type or "").lower()
@@ -189,12 +189,12 @@ async def submit(
         )
     except OcrUnavailable as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     except InvalidDocumentError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
@@ -535,6 +535,31 @@ def update_source(
     db.commit()
     db.refresh(institution)
     return institution
+
+
+@router.delete(
+    "/sources/{institution_id}",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_role("admin"))],
+)
+def delete_source(
+    institution_id: int,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    institution = db.get(Institution, institution_id)
+    if institution is None:
+        raise HTTPException(status_code=404, detail="institution source not found")
+    notice_count = db.scalar(
+        select(func.count(Notice.id)).where(Notice.institution_id == institution_id)
+    ) or 0
+    if notice_count > 0:
+        institution.active = False
+        institution.scrape_enabled = False
+        db.commit()
+        return {"status": "deactivated", "message": f"Source '{institution.slug}' deactivated ({notice_count} notices preserved)."}
+    db.delete(institution)
+    db.commit()
+    return {"status": "deleted", "message": f"Source '{institution.slug}' deleted."}
 
 
 @router.get(
